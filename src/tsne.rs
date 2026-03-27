@@ -139,13 +139,15 @@ pub fn tsne_optimize_bh(
     let mut gains = Array2::from_elem((n, 2), 1.0f64);
     let mut velocity = Array2::zeros((n, 2));
 
+    let mut ex = vec![0.0f64; n];
+    let mut ey = vec![0.0f64; n];
+
     for iter in 0..n_iter {
         let momentum = if iter < 250 { 0.5 } else { 0.8 };
         let exag = if iter < early_exaggeration_iter { early_exaggeration } else { 1.0 };
 
-        // Extract current positions
-        let ex: Vec<f64> = embedding.column(0).to_vec();
-        let ey: Vec<f64> = embedding.column(1).to_vec();
+        // Extract current positions (reuse buffers)
+        for i in 0..n { ex[i] = embedding[[i, 0]]; ey[i] = embedding[[i, 1]]; }
 
         // Build quadtree and compute repulsive forces O(n log n)
         let tree = QuadTree::build(&ex, &ey);

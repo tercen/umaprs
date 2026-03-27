@@ -94,13 +94,19 @@ impl QuadTree {
     }
 
     /// Barnes-Hut repulsion for all points. Returns (fx, fy, Z_normalization).
+    /// Parallelized — each point's tree traversal is independent.
     pub fn compute_repulsion(&self, px: &[f64], py: &[f64], theta: f64) -> (Vec<f64>, Vec<f64>, f64) {
+        use rayon::prelude::*;
         let n = px.len();
+        let results: Vec<(f64, f64, f64)> = (0..n)
+            .into_par_iter()
+            .map(|i| self.rep_single(0, px[i], py[i], theta))
+            .collect();
+
         let mut fx = vec![0.0; n];
         let mut fy = vec![0.0; n];
         let mut z = 0.0f64;
-        for i in 0..n {
-            let (fxi, fyi, zi) = self.rep_single(0, px[i], py[i], theta);
+        for (i, &(fxi, fyi, zi)) in results.iter().enumerate() {
             fx[i] = fxi;
             fy[i] = fyi;
             z += zi;
