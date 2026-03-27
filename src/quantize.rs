@@ -91,7 +91,7 @@ pub enum QuantBits {
     Eight,
 }
 
-/// Quantized vector storage
+/// Quantized vector storage with optional QJL inner product correction
 pub struct QuantizedData {
     /// Number of original samples
     pub n_samples: usize,
@@ -106,26 +106,39 @@ pub struct QuantizedData {
     /// Norms of original vectors (for distance reconstruction)
     norms: Vec<f32>,
     /// Quantized data storage
-    /// 4-bit: packed 2 values per byte, [n_samples][padded_dims/2]
-    /// 8-bit: one value per byte, [n_samples][padded_dims]
     packed: Vec<u8>,
     /// Precomputed 4-bit codebook (unused in 8-bit mode)
     centroids_4bit: [f32; 16],
-    /// 8-bit uniform quantizer range: values mapped to [-QUANT8_RANGE, +QUANT8_RANGE]
+    /// 8-bit uniform quantizer range
     quant8_range: f32,
+    /// QJL: residual norms ||r_i|| per point (None if QJL disabled)
+    qjl_residual_norms: Option<Vec<f32>>,
+    /// QJL: 1-bit sign projections, packed as u64 words
+    /// Layout: [n_samples][ceil(padded_dims/64)] u64 words
+    qjl_signs: Option<Vec<u64>>,
+    /// QJL: random sign matrix for JL projection (padded_dims × padded_dims)
+    /// Stored as packed bits: each row is padded_dims bits = ceil(padded_dims/64) u64s
+    qjl_proj: Option<Vec<u64>>,
+    /// QJL: number of u64 words per point
+    qjl_words_per_point: usize,
 }
 
 /// Range for 8-bit uniform quantizer (covers ~99.7% of N(0,1))
 const QUANT8_RANGE: f32 = 3.5;
 
 impl QuantizedData {
-    /// Quantize with 4-bit (default)
+    /// Quantize with 4-bit + QJL correction (default)
     pub fn encode(data: &Array2<f64>, seed: u64) -> Self {
-        Self::encode_with_bits(data, seed, QuantBits::Four)
+        Self::encode_with_qjl(data, seed, QuantBits::Four)
     }
 
-    /// Quantize with specified bit-width
+    /// Quantize with specified bit-width + QJL correction
     pub fn encode_with_bits(data: &Array2<f64>, seed: u64, bits: QuantBits) -> Self {
+        Self::encode_with_qjl(data, seed, bits)
+    }
+
+    /// Internal: quantize without QJL (used as first stage of encode_with_qjl)
+    fn encode_mse_only(data: &Array2<f64>, seed: u64, bits: QuantBits) -> Self {
         let n_samples = data.nrows();
         let n_dims = data.ncols();
         let padded_dims = n_dims.next_power_of_two();
@@ -199,7 +212,124 @@ impl QuantizedData {
             packed,
             centroids_4bit,
             quant8_range: QUANT8_RANGE,
+            qjl_residual_norms: None,
+            qjl_signs: None,
+            qjl_proj: None,
+            qjl_words_per_point: 0,
         }
+    }
+
+    /// Quantize with QJL inner product correction (TurboQuant_prod).
+    /// Stage 1: MSE quantization (random rotation + scalar quantize)
+    /// Stage 2: QJL 1-bit correction on residual for unbiased inner products
+    pub fn encode_with_qjl(data: &Array2<f64>, seed: u64, bits: QuantBits) -> Self {
+        let mut result = Self::encode_mse_only(data, seed, bits);
+
+        let n = result.n_samples;
+        let pd = result.padded_dims;
+        let n_dims = result.n_dims;
+        let words_per_point = (pd + 63) / 64;
+        result.qjl_words_per_point = words_per_point;
+
+        // Generate random JL sign matrix: pd × pd bits
+        // Each row j has pd random ±1 entries, stored as packed bits (1 = +1, 0 = -1)
+        let mut rng = StdRng::seed_from_u64(seed.wrapping_add(0x514A4C)) ; // "QJL" in hex
+        let mut proj = vec![0u64; pd * words_per_point];
+        for j in 0..pd {
+            for w in 0..words_per_point {
+                let mut word = 0u64;
+                for bit in 0..64 {
+                    if w * 64 + bit < pd {
+                        if rng.gen_range(0.0f32..1.0) < 0.5 { word |= 1u64 << bit; }
+                    }
+                }
+                proj[j * words_per_point + w] = word;
+            }
+        }
+
+        // For each point: compute residual in rotated space, project, sign-quantize
+        let (centroids, boundaries) = sorted_codebook();
+        let mut residual_norms = Vec::with_capacity(n);
+        let mut all_signs = Vec::with_capacity(n * words_per_point);
+
+        for i in 0..n {
+            // Reconstruct the rotated+scaled quantized vector
+            let mut rotated = vec![0.0f32; pd];
+            let mut dequant = vec![0.0f32; pd];
+
+            // Get original rotated vector (re-do the transform)
+            let mut vec = vec![0.0f32; pd];
+            for j in 0..n_dims {
+                vec[j] = data[[i, j]] as f32;
+            }
+            let norm = result.norms[i];
+            if norm > f32::EPSILON {
+                for v in vec.iter_mut() { *v /= norm; }
+            }
+            for (v, &s) in vec.iter_mut().zip(result.signs.iter()) { *v *= s; }
+            walsh_hadamard_transform(&mut vec);
+            let scale = (pd as f32).sqrt();
+            for v in vec.iter_mut() { *v *= scale; }
+            rotated.copy_from_slice(&vec);
+
+            // Dequantize
+            match bits {
+                QuantBits::Four => {
+                    let bpp = pd / 2;
+                    let offset = i * bpp;
+                    for j in 0..bpp {
+                        let byte = result.packed[offset + j];
+                        dequant[j * 2] = dequantize_scalar((byte >> 4) & 0x0F, &centroids);
+                        dequant[j * 2 + 1] = dequantize_scalar(byte & 0x0F, &centroids);
+                    }
+                }
+                QuantBits::Eight => {
+                    let offset = i * pd;
+                    let qscale = 2.0 * QUANT8_RANGE / 255.0;
+                    for j in 0..pd {
+                        dequant[j] = result.packed[offset + j] as f32 * qscale - QUANT8_RANGE;
+                    }
+                }
+            }
+
+            // Residual: r = rotated - dequant
+            let mut residual = vec![0.0f32; pd];
+            let mut r_norm_sq = 0.0f32;
+            for j in 0..pd {
+                residual[j] = rotated[j] - dequant[j];
+                r_norm_sq += residual[j] * residual[j];
+            }
+            residual_norms.push(r_norm_sq.sqrt());
+
+            // Project residual: z_j = sum_k S[j][k] * residual[k]
+            // Then store sign(z_j) as 1 bit
+            let mut point_signs = vec![0u64; words_per_point];
+            for j in 0..pd {
+                let mut z = 0.0f32;
+                for k in 0..pd {
+                    let w = k / 64;
+                    let bit = k % 64;
+                    let s = if (proj[j * words_per_point + w] >> bit) & 1 == 1 { 1.0f32 } else { -1.0f32 };
+                    z += s * residual[k];
+                }
+                // Store sign(z): 1 if z >= 0, 0 if z < 0
+                if z >= 0.0 {
+                    let w = j / 64;
+                    let bit = j % 64;
+                    point_signs[w] |= 1u64 << bit;
+                }
+            }
+            all_signs.extend_from_slice(&point_signs);
+        }
+
+        result.qjl_residual_norms = Some(residual_norms);
+        result.qjl_signs = Some(all_signs);
+        result.qjl_proj = Some(proj);
+
+        eprintln!("QJL: {} extra bytes/point ({} bits signs + 4 bytes norm)",
+                  words_per_point * 8 + 4, pd);
+
+        result
     }
 
     /// Dequantize a single vector to f32
@@ -287,8 +417,31 @@ impl QuantizedData {
             }
         };
 
+        // QJL correction: unbiased inner product via residual sign agreement
+        // <r_i, r_j> ≈ (sqrt(π/2) / d) · ||r_i|| · ||r_j|| · (d - 2·hamming(signs_i, signs_j))
+        let qjl_correction = {
+            let r_norms = self.qjl_residual_norms.as_ref().unwrap();
+            let signs = self.qjl_signs.as_ref().unwrap();
+            let wpp = self.qjl_words_per_point;
+            let off_i = i * wpp;
+            let off_j = j * wpp;
+
+            // XOR + popcount = Hamming distance (number of disagreeing bits)
+            let mut xor_popcount = 0u32;
+            for w in 0..wpp {
+                xor_popcount += (signs[off_i + w] ^ signs[off_j + w]).count_ones();
+            }
+            let d = self.padded_dims as f32;
+            // agreement ∈ [-d, +d]: positive means similar residuals
+            let agreement = d - 2.0 * xor_popcount as f32;
+
+            const SQRT_PI_OVER_2: f32 = 1.2533141;
+            SQRT_PI_OVER_2 / d * r_norms[i] * r_norms[j] * agreement
+        };
+
+        let corrected_dot = dot + qjl_correction;
         let inv_d = 1.0 / self.padded_dims as f32;
-        let cos_theta = (dot * inv_d).clamp(-1.0, 1.0);
+        let cos_theta = (corrected_dot * inv_d).clamp(-1.0, 1.0);
         ni * ni + nj * nj - 2.0 * ni * nj * cos_theta
     }
 
