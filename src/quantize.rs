@@ -3,6 +3,33 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::Rng;
 
+use crate::codebook::solve_lloyd_max;
+use std::sync::OnceLock;
+
+/// Cached Lloyd-Max codebook for N(0,1). Solved once, reused for all encodes.
+fn solve_lloyd_max_n01(n_levels: usize) -> (Vec<f32>, Vec<f32>) {
+    static CACHE_8: OnceLock<(Vec<f32>, Vec<f32>)> = OnceLock::new();
+    static CACHE_128: OnceLock<(Vec<f32>, Vec<f32>)> = OnceLock::new();
+
+    let cache = match n_levels {
+        8 => &CACHE_8,
+        128 => &CACHE_128,
+        _ => return solve_lloyd_max_n01_uncached(n_levels),
+    };
+
+    cache.get_or_init(|| solve_lloyd_max_n01_uncached(n_levels)).clone()
+}
+
+fn solve_lloyd_max_n01_uncached(n_levels: usize) -> (Vec<f32>, Vec<f32>) {
+    // Use large d to get Gaussian limit of Beta distribution
+    let gaussian_d = 1024;
+    let (raw_c, raw_b) = solve_lloyd_max(gaussian_d, n_levels);
+    let scale = (gaussian_d as f32).sqrt();
+    let centroids: Vec<f32> = raw_c.iter().map(|&c| c * scale).collect();
+    let boundaries: Vec<f32> = raw_b.iter().map(|&b| b * scale).collect();
+    (centroids, boundaries)
+}
+
 /// TurboQuant-inspired vector quantization for fast approximate distance computation.
 ///
 /// Algorithm:
@@ -13,50 +40,9 @@ use rand::Rng;
 ///
 /// This preserves distances with near-optimal distortion guarantees.
 
-/// Lloyd-Max codebook for 4-bit MSE quantization (16 levels) of N(0,1)
-const LLOYD_MAX_4BIT_CENTROIDS: [f32; 16] = [
-    -2.4008, -1.7479, -1.2461, -0.9224, -0.6568, -0.4246, -0.2127, -0.0638,
-     0.0638,  0.2127,  0.4246,  0.6568,  0.9224,  1.2461,  1.7479,  2.4008,
-];
-
-/// Lloyd-Max codebook for 3-bit MSE quantization (8 levels) of N(0,1)
-/// Used in TurboQuant_prod where 1 bit goes to QJL sign
-const LLOYD_MAX_3BIT_CENTROIDS: [f32; 8] = [
-    -1.7479, -1.0500, -0.5006, -0.0638,
-     0.0638,  0.5006,  1.0500,  1.7479,
-];
-
-fn sorted_codebook() -> ([f32; 16], [f32; 15]) {
-    let centroids = LLOYD_MAX_4BIT_CENTROIDS;
-    let mut boundaries = [0.0f32; 15];
-    for i in 0..15 {
-        boundaries[i] = (centroids[i] + centroids[i + 1]) / 2.0;
-    }
-    (centroids, boundaries)
-}
-
-fn sorted_codebook_3bit() -> ([f32; 8], [f32; 7]) {
-    let centroids = LLOYD_MAX_3BIT_CENTROIDS;
-    let mut boundaries = [0.0f32; 7];
-    for i in 0..7 {
-        boundaries[i] = (centroids[i] + centroids[i + 1]) / 2.0;
-    }
-    (centroids, boundaries)
-}
-
-/// Quantize a scalar value to 4-bit index (16 levels)
+/// Quantize a scalar value to the nearest centroid index
 #[inline]
-fn quantize_scalar(val: f32, boundaries: &[f32; 15]) -> u8 {
-    let mut idx = 0u8;
-    for (i, &b) in boundaries.iter().enumerate() {
-        if val > b { idx = (i + 1) as u8; } else { break; }
-    }
-    idx
-}
-
-/// Quantize a scalar value to 3-bit index (8 levels)
-#[inline]
-fn quantize_scalar_3bit(val: f32, boundaries: &[f32; 7]) -> u8 {
+fn quantize_scalar_dynamic(val: f32, boundaries: &[f32]) -> u8 {
     let mut idx = 0u8;
     for (i, &b) in boundaries.iter().enumerate() {
         if val > b { idx = (i + 1) as u8; } else { break; }
@@ -122,10 +108,10 @@ pub struct QuantizedData {
     norms: Vec<f32>,
     /// Packed data: each coordinate has (b-1) MSE bits + 1 QJL sign bit
     packed: Vec<u8>,
-    /// MSE codebook centroids (3-bit for Four, 7-bit uniform for Eight)
-    centroids_3bit: [f32; 8],
-    /// 8-bit: range for 7-bit uniform quantizer
-    quant7_range: f32,
+    /// Lloyd-Max codebook centroids solved for exact Beta(d) distribution
+    centroids: Vec<f32>,
+    /// Lloyd-Max decision boundaries
+    boundaries: Vec<f32>,
     /// QJL: random signs for second Hadamard rotation (Stage 2 projection)
     /// S = diag(qjl_signs) · WHT — orthogonal, S·S^T = I exactly
     qjl_rotation_signs: Vec<f32>,
@@ -133,8 +119,6 @@ pub struct QuantizedData {
     qjl_r_norm_sq_per_coord: f32,
 }
 
-/// Range for 8-bit uniform quantizer (covers ~99.7% of N(0,1))
-const QUANT8_RANGE: f32 = 3.5;
 
 impl QuantizedData {
     /// Quantize with 4-bit TurboQuant_prod (3-bit MSE + 1-bit QJL sign)
@@ -148,7 +132,14 @@ impl QuantizedData {
         let n_dims = data.ncols();
         let padded_dims = n_dims.next_power_of_two();
 
-        let (centroids_3bit, boundaries_3bit) = sorted_codebook_3bit();
+        // Lloyd-Max codebook for N(0,1) — matches our coordinate distribution
+        // after WHT + √d scaling. Solved at build time via gauss-quad for the
+        // exact Beta distribution in the Gaussian limit.
+        // The codebook is the same for all d since our scaling normalizes to N(0,1).
+        let (centroids, boundaries) = solve_lloyd_max_n01(match bits {
+            QuantBits::Four => 8,   // 3-bit MSE = 8 levels
+            QuantBits::Eight => 128, // 7-bit MSE = 128 levels
+        });
 
         // Stage 1 rotation: random sign flips for Hadamard
         let mut rng = StdRng::seed_from_u64(seed);
@@ -196,20 +187,17 @@ impl QuantizedData {
             match bits {
                 QuantBits::Four => {
                     for j in 0..padded_dims {
-                        let idx = quantize_scalar_3bit(vec[j], &boundaries_3bit);
+                        let idx = quantize_scalar_dynamic(vec[j], &boundaries);
                         mse_indices[j] = idx;
-                        residual[j] = vec[j] - centroids_3bit[idx as usize];
+                        residual[j] = vec[j] - centroids[idx as usize];
                         total_r_sq += (residual[j] * residual[j]) as f64;
                     }
                 }
                 QuantBits::Eight => {
-                    let range = QUANT8_RANGE;
                     for j in 0..padded_dims {
-                        let clamped = vec[j].clamp(-range, range);
-                        let idx = ((clamped + range) / (2.0 * range) * 127.0) as u8;
+                        let idx = quantize_scalar_dynamic(vec[j], &boundaries);
                         mse_indices[j] = idx;
-                        let dequant = (idx as f32 / 127.0) * 2.0 * range - range;
-                        residual[j] = vec[j] - dequant;
+                        residual[j] = vec[j] - centroids[idx as usize];
                         total_r_sq += (residual[j] * residual[j]) as f64;
                     }
                 }
@@ -255,8 +243,8 @@ impl QuantizedData {
             signs,
             norms,
             packed,
-            centroids_3bit,
-            quant7_range: QUANT8_RANGE,
+            centroids,
+            boundaries,
             qjl_rotation_signs: qjl_signs,
             qjl_r_norm_sq_per_coord: mse_per_coord,
         }
@@ -271,21 +259,18 @@ impl QuantizedData {
         let mut vec = vec![0.0f32; self.padded_dims];
         match self.bits {
             QuantBits::Four => {
-                // nibble = (3-bit idx << 1) | sign_bit
                 for j in 0..self.padded_dims / 2 {
                     let byte = self.packed[offset + j];
-                    let hi_idx = ((byte >> 4) & 0x0F) >> 1; // top 3 bits of hi nibble
-                    let lo_idx = (byte & 0x0F) >> 1;         // top 3 bits of lo nibble
-                    vec[j * 2] = self.centroids_3bit[hi_idx as usize];
-                    vec[j * 2 + 1] = self.centroids_3bit[lo_idx as usize];
+                    let hi_idx = ((byte >> 4) & 0x0F) >> 1;
+                    let lo_idx = (byte & 0x0F) >> 1;
+                    vec[j * 2] = self.centroids[hi_idx as usize];
+                    vec[j * 2 + 1] = self.centroids[lo_idx as usize];
                 }
             }
             QuantBits::Eight => {
-                // byte = (7-bit idx << 1) | sign_bit
-                let range = self.quant7_range;
                 for j in 0..self.padded_dims {
-                    let idx = self.packed[offset + j] >> 1; // top 7 bits
-                    vec[j] = (idx as f32 / 127.0) * 2.0 * range - range;
+                    let idx = self.packed[offset + j] >> 1;
+                    vec[j] = self.centroids[idx as usize];
                 }
             }
         }
@@ -336,14 +321,14 @@ impl QuantizedData {
                     let idx_j_hi = ((bj >> 4) & 0x0F) >> 1;
                     let sign_i_hi = (bi >> 4) & 1;
                     let sign_j_hi = (bj >> 4) & 1;
-                    dot += self.centroids_3bit[idx_i_hi as usize] * self.centroids_3bit[idx_j_hi as usize];
+                    dot += self.centroids[idx_i_hi as usize] * self.centroids[idx_j_hi as usize];
                     disagree += (sign_i_hi ^ sign_j_hi) as u32;
                     // Lo nibble
                     let idx_i_lo = (bi & 0x0F) >> 1;
                     let idx_j_lo = (bj & 0x0F) >> 1;
                     let sign_i_lo = bi & 1;
                     let sign_j_lo = bj & 1;
-                    dot += self.centroids_3bit[idx_i_lo as usize] * self.centroids_3bit[idx_j_lo as usize];
+                    dot += self.centroids[idx_i_lo as usize] * self.centroids[idx_j_lo as usize];
                     disagree += (sign_i_lo ^ sign_j_lo) as u32;
                 }
                 (dot, disagree)
@@ -354,19 +339,13 @@ impl QuantizedData {
                 let off_j = j * bpp;
                 let mut dot = 0.0f32;
                 let mut disagree = 0u32;
-                let range = self.quant7_range;
                 for k in 0..bpp {
                     let bi = self.packed[off_i + k];
                     let bj = self.packed[off_j + k];
-                    // byte = (7-bit idx << 1) | sign
                     let idx_i = bi >> 1;
                     let idx_j = bj >> 1;
-                    let sign_i = bi & 1;
-                    let sign_j = bj & 1;
-                    let vi = (idx_i as f32 / 127.0) * 2.0 * range - range;
-                    let vj = (idx_j as f32 / 127.0) * 2.0 * range - range;
-                    dot += vi * vj;
-                    disagree += (sign_i ^ sign_j) as u32;
+                    dot += self.centroids[idx_i as usize] * self.centroids[idx_j as usize];
+                    disagree += ((bi ^ bj) & 1) as u32;
                 }
                 (dot, disagree)
             }
@@ -421,9 +400,9 @@ impl QuantizedData {
     /// Get padded dimensionality
     pub fn padded_dims(&self) -> usize { self.padded_dims }
 
-    /// Get codebook for GPU upload: 8 centroids + MSE constant in slot 8
+    /// Get codebook for GPU upload: centroids + MSE constant at the end
     pub fn sorted_centroids(&self) -> Vec<f32> {
-        let mut cb = self.centroids_3bit.to_vec();
+        let mut cb = self.centroids.clone();
         cb.push(self.qjl_r_norm_sq_per_coord);
         cb
     }

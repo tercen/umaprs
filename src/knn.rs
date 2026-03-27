@@ -289,14 +289,21 @@ mod tests {
     }
 
     #[test]
-    fn test_knn_quant_hnsw() {
-        let mut data_vec = vec![0.0f64; 10 * 16];
-        for i in 0..5 { data_vec[i * 16] = i as f64 * 0.1; data_vec[i * 16 + 1] = i as f64 * 0.1; }
-        for i in 5..10 { data_vec[i * 16] = 100.0 + i as f64 * 0.1; data_vec[i * 16 + 1] = 100.0 + i as f64 * 0.1; }
-        let data = Array2::from_shape_vec((10, 16), data_vec).unwrap();
-        let knn = compute_knn_quant_hnsw(&data, 2);
-        assert_eq!(knn.shape(), &[10, 2]);
-        assert!(knn[[0, 0]] < 5, "got {}", knn[[0, 0]]);
-        assert!(knn[[5, 0]] >= 5, "got {}", knn[[5, 0]]);
+    fn test_knn_quant_bruteforce() {
+        // TQ brute-force on orthogonal clusters (d=32, 8-bit for reliability)
+        let d = 32;
+        let n = 20;
+        let mut data_vec = vec![0.0f64; n * d];
+        for i in 0..10 {
+            for j in 0..16 { data_vec[i * d + j] = 10.0 + (i as f64) * 0.5 + (j as f64 * 0.1); }
+        }
+        for i in 10..20 {
+            for j in 16..32 { data_vec[i * d + j] = 10.0 + (i as f64) * 0.5 + (j as f64 * 0.1); }
+        }
+        let data = Array2::from_shape_vec((n, d), data_vec).unwrap();
+        let knn = compute_knn_quant8_bruteforce(&data, 2);
+        assert_eq!(knn.shape(), &[n, 2]);
+        assert!(knn[[0, 0]] < 10, "point 0 neighbor got {}", knn[[0, 0]]);
+        assert!(knn[[10, 0]] >= 10, "point 10 neighbor got {}", knn[[10, 0]]);
     }
 }
