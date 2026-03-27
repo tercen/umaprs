@@ -76,6 +76,10 @@ fn main() {
         run(&data, "GPU TQ4", "results/cyto_emb_gpu_tq4.csv",
             &UMAP::new().n_neighbors(15).n_epochs(200).random_state(42).knn_method(KnnMethod::GpuTQ4),
             &mut timings);
+
+        run(&data, "GPU TQ8", "results/cyto_emb_gpu_tq8.csv",
+            &UMAP::new().n_neighbors(15).n_epochs(200).random_state(42).knn_method(KnnMethod::GpuTQ8),
+            &mut timings);
     }
 
     // Write timings CSV for R

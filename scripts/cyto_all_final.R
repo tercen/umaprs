@@ -27,7 +27,8 @@ embs <- list(
     "TQ8+QJL"  = read_if("results/cyto_emb_tq8.csv"),
     "train 10%"   = read_if("results/cyto_emb_train10.csv"),
     "GPU f32"      = read_if("results/cyto_emb_gpu.csv"),
-    "GPU TQ4"      = read_if("results/cyto_emb_gpu_tq4.csv")
+    "GPU TQ4"      = read_if("results/cyto_emb_gpu_tq4.csv"),
+    "GPU TQ8"      = read_if("results/cyto_emb_gpu_tq8.csv")
 )
 embs[["R uwot"]] <- uwot_emb
 

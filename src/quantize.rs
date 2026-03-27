@@ -424,9 +424,12 @@ impl QuantizedData {
     /// Get codebook for GPU upload: 8 centroids + MSE constant in slot 8
     pub fn sorted_centroids(&self) -> Vec<f32> {
         let mut cb = self.centroids_3bit.to_vec();
-        cb.push(self.qjl_r_norm_sq_per_coord); // slot 8: MSE per coord for QJL correction
+        cb.push(self.qjl_r_norm_sq_per_coord);
         cb
     }
+
+    /// Get MSE per coordinate (for GPU QJL correction)
+    pub fn mse_per_coord(&self) -> f32 { self.qjl_r_norm_sq_per_coord }
 }
 
 

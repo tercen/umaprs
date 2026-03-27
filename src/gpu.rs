@@ -24,6 +24,7 @@ mod inner {
     struct GpuKernels {
         dev: Arc<CudaDevice>,
         tq4_dot: CudaFunction,
+        tq8_dot: CudaFunction,
         topk: CudaFunction,
         f32_dot: CudaFunction,
     }
@@ -31,10 +32,11 @@ mod inner {
     fn load_kernels() -> GpuKernels {
         let dev = CudaDevice::new(0).expect("CUDA device");
         let ptx = compile_ptx(CUDA_SRC).expect("NVRTC compilation failed");
-        dev.load_ptx(ptx, "umaprs", &["tq4_dot", "topk", "f32_dot"])
+        dev.load_ptx(ptx, "umaprs", &["tq4_dot", "tq8_dot", "topk", "f32_dot"])
             .expect("Load kernels");
         GpuKernels {
             tq4_dot: dev.get_func("umaprs", "tq4_dot").unwrap(),
+            tq8_dot: dev.get_func("umaprs", "tq8_dot").unwrap(),
             topk: dev.get_func("umaprs", "topk").unwrap(),
             f32_dot: dev.get_func("umaprs", "f32_dot").unwrap(),
             dev,
@@ -256,10 +258,132 @@ mod inner {
 
         knn_indices
     }
+    /// GPU TQ8: packed 8-bit dot products + topk, all on GPU
+    pub fn compute_knn_gpu_tq8(data: &Array2<f64>, k: usize) -> Array2<usize> {
+        use crate::quantize::{QuantizedData, QuantBits};
+
+        let n = data.nrows();
+        let d = data.ncols();
+        eprintln!("GPU TQ8 kNN: {} points, {} dims", n, d);
+
+        let qdata = QuantizedData::encode_with_bits(data, 42, QuantBits::Eight);
+        let packed = qdata.packed_data();
+        let norms = qdata.norms();
+        let padded_dims = qdata.padded_dims();
+        let bpp = padded_dims; // 1 byte per coordinate for 8-bit
+
+        eprintln!("  Memory: {} KB -> {} KB ({:.1}x)",
+                  n * d * 8 / 1024, qdata.memory_bytes() / 1024,
+                  (n * d * 8) as f64 / qdata.memory_bytes() as f64);
+
+        let kern = load_kernels();
+        let dev = &kern.dev;
+
+        let d_all_packed = dev.htod_sync_copy(packed).expect("Upload packed");
+        let d_norms = dev.htod_sync_copy(norms).expect("Upload norms");
+
+        let tile_bytes: usize = 512 * 1024 * 1024;
+        let tile_size = (tile_bytes / (n * 4)).max(1).min(n);
+        eprintln!("  Tile: {} rows, {} tiles", tile_size, (n + tile_size - 1) / tile_size);
+
+        let inv_d = 1.0f32 / padded_dims as f32;
+        let refine_k = k * 2;
+        let quant_range = 3.5f32;
+        let mse_per_coord = qdata.mse_per_coord();
+        let mut knn_indices = Array2::zeros((n, k));
+        let mut row_start = 0;
+
+        while row_start < n {
+            let row_end = (row_start + tile_size).min(n);
+            let tile_rows = row_end - row_start;
+
+            let tile_packed = &packed[row_start * bpp..row_end * bpp];
+            let d_tile = dev.htod_sync_copy(tile_packed).expect("Upload tile");
+            let mut d_dots = dev.alloc_zeros::<f32>(tile_rows * n).expect("Alloc dots");
+
+            // TQ8 dot kernel
+            let dot_cfg = LaunchConfig {
+                grid_dim: (((n as u32) + 15) / 16, ((tile_rows as u32) + 15) / 16, 1),
+                block_dim: (16, 16, 1),
+                shared_mem_bytes: 0,
+            };
+            let ptr_a = *d_tile.device_ptr();
+            let ptr_b = *d_all_packed.device_ptr();
+            let mut ptr_c = *d_dots.device_ptr_mut();
+            let (arg_tr, arg_n, arg_d) = (tile_rows as i32, n as i32, padded_dims as i32);
+            let mut dot_args: Vec<*mut std::ffi::c_void> = vec![
+                &ptr_a as *const _ as *mut _, &ptr_b as *const _ as *mut _,
+                &mut ptr_c as *mut _ as *mut _,
+                &arg_tr as *const _ as *mut _, &arg_n as *const _ as *mut _,
+                &arg_d as *const _ as *mut _,
+                &quant_range as *const _ as *mut _, &mse_per_coord as *const _ as *mut _,
+            ];
+            unsafe { kern.tq8_dot.clone().launch(dot_cfg, &mut dot_args).expect("tq8_dot failed"); }
+
+            // topk on GPU
+            let tile_norms: Vec<f32> = norms[row_start..row_end].to_vec();
+            let d_tile_norms = dev.htod_sync_copy(&tile_norms).expect("Upload tile norms");
+            let mut d_topk = dev.alloc_zeros::<u32>(tile_rows * refine_k).expect("Alloc topk");
+
+            let topk_cfg = LaunchConfig {
+                grid_dim: (tile_rows as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let ptr_dots = *d_dots.device_ptr();
+            let ptr_tn = *d_tile_norms.device_ptr();
+            let ptr_an = *d_norms.device_ptr();
+            let mut ptr_tk = *d_topk.device_ptr_mut();
+            let (arg_rk, arg_off) = (refine_k as i32, row_start as i32);
+            let mode = 1i32; // TQ mode
+            let mut topk_args: Vec<*mut std::ffi::c_void> = vec![
+                &ptr_dots as *const _ as *mut _, &ptr_tn as *const _ as *mut _,
+                &ptr_an as *const _ as *mut _, &mut ptr_tk as *mut _ as *mut _,
+                &arg_tr as *const _ as *mut _, &arg_n as *const _ as *mut _,
+                &arg_rk as *const _ as *mut _, &arg_off as *const _ as *mut _,
+                &inv_d as *const _ as *mut _, &mode as *const _ as *mut _,
+            ];
+            unsafe { kern.topk.clone().launch(topk_cfg, &mut topk_args).expect("topk failed"); }
+
+            // Download tiny topk, refine on CPU
+            let topk_idx: Vec<u32> = dev.dtoh_sync_copy(&d_topk).expect("Download topk");
+
+            let tile_results: Vec<Vec<usize>> = (0..tile_rows)
+                .into_par_iter()
+                .map(|ti| {
+                    let i = row_start + ti;
+                    let candidates: Vec<usize> = (0..refine_k)
+                        .map(|r| topk_idx[ti * refine_k + r] as usize)
+                        .filter(|&j| j != i && j < n)
+                        .collect();
+                    let point = data.row(i);
+                    let mut exact: Vec<(usize, f64)> = candidates.iter()
+                        .map(|&j| {
+                            let d: f64 = point.iter().zip(data.row(j).iter())
+                                .map(|(&a, &b)| (a - b).powi(2)).sum();
+                            (j, d)
+                        })
+                        .collect();
+                    exact.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                    exact.iter().take(k).map(|&(nb, _)| nb).collect()
+                })
+                .collect();
+
+            for (ti, neighbors) in tile_results.iter().enumerate() {
+                for (idx, &nb) in neighbors.iter().enumerate() {
+                    knn_indices[[row_start + ti, idx]] = nb;
+                }
+            }
+
+            row_start = row_end;
+        }
+
+        knn_indices
+    }
 }
 
 #[cfg(feature = "cuda")]
-pub use inner::{compute_knn_gpu, compute_knn_gpu_tq4};
+pub use inner::{compute_knn_gpu, compute_knn_gpu_tq4, compute_knn_gpu_tq8};
 
 #[cfg(not(feature = "cuda"))]
 pub fn compute_knn_gpu(_data: &Array2<f64>, _k: usize) -> Array2<usize> {
@@ -268,6 +392,10 @@ pub fn compute_knn_gpu(_data: &Array2<f64>, _k: usize) -> Array2<usize> {
 #[cfg(not(feature = "cuda"))]
 pub fn compute_knn_gpu_tq4(_data: &Array2<f64>, _k: usize) -> Array2<usize> {
     panic!("GPU TQ4 requires the 'cuda' feature: cargo build --features cuda")
+}
+#[cfg(not(feature = "cuda"))]
+pub fn compute_knn_gpu_tq8(_data: &Array2<f64>, _k: usize) -> Array2<usize> {
+    panic!("GPU TQ8 requires the 'cuda' feature: cargo build --features cuda")
 }
 #[cfg(not(feature = "cuda"))]
 pub fn compute_knn_gpu_tile(_data: &Array2<f64>, _k: usize, _tile_mb: usize) -> Array2<usize> {
