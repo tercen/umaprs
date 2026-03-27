@@ -136,8 +136,20 @@ pub fn tsne_optimize_bh(
     theta: f64,
 ) {
     let n = embedding.nrows();
-    let mut gains = Array2::from_elem((n, 2), 1.0f64);
-    let mut velocity = Array2::zeros((n, 2));
+    let mut gains_x = vec![1.0f64; n];
+    let mut gains_y = vec![1.0f64; n];
+    let mut vel_x = vec![0.0f64; n];
+    let mut vel_y = vec![0.0f64; n];
+
+    // Pre-sort edges by source for cache-friendly access
+    let mut sorted_edges: Vec<(usize, usize, f64)> = (0..p_rows.len())
+        .map(|idx| (p_rows[idx], p_cols[idx], p_vals[idx]))
+        .collect();
+    sorted_edges.sort_unstable_by_key(|&(i, _, _)| i);
+    let se_i: Vec<usize> = sorted_edges.iter().map(|e| e.0).collect();
+    let se_j: Vec<usize> = sorted_edges.iter().map(|e| e.1).collect();
+    let se_p: Vec<f64> = sorted_edges.iter().map(|e| e.2).collect();
+    let n_edges = se_i.len();
 
     let mut ex = vec![0.0f64; n];
     let mut ey = vec![0.0f64; n];
@@ -150,47 +162,54 @@ pub fn tsne_optimize_bh(
         for i in 0..n { ex[i] = embedding[[i, 0]]; ey[i] = embedding[[i, 1]]; }
 
         // Build quadtree and compute repulsive forces O(n log n)
+        let t0 = std::time::Instant::now();
         let tree = QuadTree::build(&ex, &ey);
         let (rep_fx, rep_fy, z_sum) = tree.compute_repulsion(&ex, &ey, theta);
 
-        let mut grad = Array2::zeros((n, 2));
+        let t0 = std::time::Instant::now();
 
-        // Attractive forces (sparse, from P matrix)
-        for idx in 0..p_rows.len() {
-            let i = p_rows[idx];
-            let j = p_cols[idx];
-            let p = p_vals[idx] * exag;
-
-            let dx = ex[i] - ex[j];
-            let dy = ey[i] - ey[j];
-            let d2 = dx * dx + dy * dy;
-            let q = 1.0 / (1.0 + d2);
-
-            let mult = 4.0 * p * q;
-            grad[[i, 0]] += mult * dx;
-            grad[[i, 1]] += mult * dy;
-        }
-
-        // Repulsive forces from Barnes-Hut (already computed)
+        // Attractive + repulsive forces combined
         let z_inv = 1.0 / z_sum.max(1e-20);
+        let mut grad_x = vec![0.0f64; n];
+        let mut grad_y = vec![0.0f64; n];
+
+        // Repulsive (from BH)
         for i in 0..n {
-            grad[[i, 0]] -= 4.0 * z_inv * rep_fx[i];
-            grad[[i, 1]] -= 4.0 * z_inv * rep_fy[i];
+            grad_x[i] = -4.0 * z_inv * rep_fx[i];
+            grad_y[i] = -4.0 * z_inv * rep_fy[i];
         }
 
-        // Update with momentum + adaptive gains
-        for i in 0..n {
-            for c in 0..2usize {
-                let g: f64 = grad[[i, c]];
-                let v: f64 = velocity[[i, c]];
-                if (g > 0.0) != (v > 0.0) {
-                    gains[[i, c]] = (gains[[i, c]] + 0.2).min(10.0);
-                } else {
-                    gains[[i, c]] = (gains[[i, c]] * 0.8).max(0.01);
-                }
-                velocity[[i, c]] = momentum * v - learning_rate * gains[[i, c]] * g;
-                embedding[[i, c]] += velocity[[i, c]];
+        // Attractive (sorted by source for cache locality)
+        for idx in 0..n_edges {
+            let i = unsafe { *se_i.get_unchecked(idx) };
+            let j = unsafe { *se_j.get_unchecked(idx) };
+            let p = unsafe { *se_p.get_unchecked(idx) } * exag;
+            let dx = unsafe { *ex.get_unchecked(i) - *ex.get_unchecked(j) };
+            let dy = unsafe { *ey.get_unchecked(i) - *ey.get_unchecked(j) };
+            let q = 1.0 / (1.0 + dx * dx + dy * dy);
+            let mult = 4.0 * p * q;
+            unsafe {
+                *grad_x.get_unchecked_mut(i) += mult * dx;
+                *grad_y.get_unchecked_mut(i) += mult * dy;
             }
+        }
+
+        let t0 = std::time::Instant::now();
+
+        // Update with momentum + adaptive gains (flat arrays, no ndarray overhead)
+        for i in 0..n {
+            let gx = grad_x[i];
+            let gy = grad_y[i];
+
+            if (gx > 0.0) != (vel_x[i] > 0.0) { gains_x[i] = (gains_x[i] + 0.2).min(10.0); }
+            else { gains_x[i] = (gains_x[i] * 0.8).max(0.01); }
+            if (gy > 0.0) != (vel_y[i] > 0.0) { gains_y[i] = (gains_y[i] + 0.2).min(10.0); }
+            else { gains_y[i] = (gains_y[i] * 0.8).max(0.01); }
+
+            vel_x[i] = momentum * vel_x[i] - learning_rate * gains_x[i] * gx;
+            vel_y[i] = momentum * vel_y[i] - learning_rate * gains_y[i] * gy;
+            embedding[[i, 0]] += vel_x[i];
+            embedding[[i, 1]] += vel_y[i];
         }
 
         // Center
