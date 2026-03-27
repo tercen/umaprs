@@ -12,3 +12,4 @@ data/bench_*.csv
 
 # Results are regenerated
 results/
+data/aml/
