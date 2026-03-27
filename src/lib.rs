@@ -1,5 +1,6 @@
 use ndarray::Array2;
 
+mod gpu;
 mod hnsw;
 mod kdtree;
 mod knn;
@@ -43,6 +44,8 @@ pub enum KnnMethod {
     TurboQuant8KdTree,
     TurboQuant4Hnsw,
     TurboQuant8Hnsw,
+    /// GPU brute-force via cuBLAS (requires 'cuda' feature)
+    Gpu,
 }
 
 /// Model export format
@@ -157,6 +160,7 @@ impl UMAP {
             KnnMethod::TurboQuant8KdTree => compute_knn_quant8_kdtree(data, k),
             KnnMethod::TurboQuant4Hnsw => compute_knn_quant_hnsw(data, k),
             KnnMethod::TurboQuant8Hnsw => compute_knn_quant_hnsw_8bit(data, k),
+            KnnMethod::Gpu => gpu::compute_knn_gpu(data, k),
         }
     }
 
