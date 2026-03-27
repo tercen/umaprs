@@ -105,17 +105,18 @@ pub enum QuantBits {
 /// TurboQuant_prod: (b-1)-bit MSE + 1-bit QJL sign per coordinate.
 /// Total bits per coordinate = b (same budget, better inner products).
 ///
-/// Packing (4-bit mode): nibble = (3-bit MSE index) << 1 | sign_bit
-/// Packing (8-bit mode): byte  = (7-bit MSE index) << 1 | sign_bit
+/// Following the paper exactly:
+///   Stage 1: Random rotation (Hadamard + signs) → (b-1)-bit Lloyd-Max per coordinate
+///   Stage 2: QJL on residual: q = sign(S · r) where S is a separate random sign matrix
 ///
-/// For inner product: dot ≈ mse_dot + √(π/2)/d · ||r_i|| · ||r_j|| · sign_agreement
-/// sign_agreement = d - 2·hamming(signs_i, signs_j), computed via XOR+popcount.
+/// Packing: nibble/byte = (MSE index << 1) | qjl_sign_bit
+/// Inner product: dot ≈ mse_dot + √(π/2)/d · ||r_i|| · ||r_j|| · sign_agreement
 pub struct QuantizedData {
     pub n_samples: usize,
     pub n_dims: usize,
     padded_dims: usize,
     bits: QuantBits,
-    /// Random sign flips for Hadamard randomization
+    /// Random sign flips for Hadamard randomization (Stage 1 rotation)
     signs: Vec<f32>,
     /// Norms of original vectors
     norms: Vec<f32>,
@@ -125,9 +126,12 @@ pub struct QuantizedData {
     centroids_3bit: [f32; 8],
     /// 8-bit: range for 7-bit uniform quantizer
     quant7_range: f32,
-    /// QJL: global ||r||² per coordinate (constant for all points after WHT)
-    /// The Hadamard rotation makes all coordinates ~N(0,1), so quantization
-    /// MSE is the same for every point. ||r_i||·||r_j|| ≈ d·mse_per_coord.
+    /// QJL: random sign matrix S for residual projection (d × d, packed bits)
+    /// S[j][k] = +1 if bit set, -1 otherwise. Stored as d rows of ceil(d/64) u64 words.
+    qjl_sign_matrix: Vec<u64>,
+    /// Number of u64 words per row of S
+    qjl_words_per_row: usize,
+    /// QJL: global ||r||² per coordinate (constant approximation after WHT)
     qjl_r_norm_sq_per_coord: f32,
 }
 
@@ -148,13 +152,31 @@ impl QuantizedData {
 
         let (centroids_3bit, boundaries_3bit) = sorted_codebook_3bit();
 
+        // Stage 1 rotation: random sign flips for Hadamard
         let mut rng = StdRng::seed_from_u64(seed);
         let signs: Vec<f32> = (0..padded_dims)
             .map(|_| { let v: f32 = rng.gen_range(0.0..1.0); if v < 0.5 { 1.0 } else { -1.0 } })
             .collect();
 
+        // Stage 2 QJL: generate separate random sign matrix S (d × d)
+        // S[j][k] = ±1 random, stored as packed bits
+        let mut qjl_rng = StdRng::seed_from_u64(seed.wrapping_add(0x514A4C));
+        let words_per_row = (padded_dims + 63) / 64;
+        let mut qjl_sign_matrix = vec![0u64; padded_dims * words_per_row];
+        for j in 0..padded_dims {
+            for w in 0..words_per_row {
+                let mut word = 0u64;
+                for bit in 0..64 {
+                    if w * 64 + bit < padded_dims {
+                        if qjl_rng.gen_range(0.0f32..1.0) < 0.5 { word |= 1u64 << bit; }
+                    }
+                }
+                qjl_sign_matrix[j * words_per_row + w] = word;
+            }
+        }
+
         let mut norms = Vec::with_capacity(n_samples);
-        let mut total_r_sq = 0.0f64; // accumulate residual² across all coords and points
+        let mut total_r_sq = 0.0f64;
         let bytes_per_point = match bits {
             QuantBits::Four => padded_dims / 2,
             QuantBits::Eight => padded_dims,
@@ -162,67 +184,84 @@ impl QuantizedData {
         let mut packed = Vec::with_capacity(n_samples * bytes_per_point);
 
         for i in 0..n_samples {
+            // Normalize to unit sphere
             let mut vec = vec![0.0f32; padded_dims];
             for j in 0..n_dims {
                 vec[j] = data[[i, j]] as f32;
             }
-
             let norm: f32 = vec.iter().map(|&v| v * v).sum::<f32>().sqrt();
             norms.push(norm);
-
             if norm > f32::EPSILON {
                 for v in vec.iter_mut() { *v /= norm; }
             }
 
+            // Stage 1: Hadamard rotation
             for (v, &s) in vec.iter_mut().zip(signs.iter()) { *v *= s; }
             walsh_hadamard_transform(&mut vec);
             let scale = (padded_dims as f32).sqrt();
             for v in vec.iter_mut() { *v *= scale; }
 
-            // Quantize + compute residual sign (QJL) in one pass
-            // Pack: (b-1)-bit MSE index shifted left by 1, OR'd with sign(residual)
+            // Stage 1: MSE quantize + compute residual per coordinate
+            let mut mse_indices = vec![0u8; padded_dims];
+            let mut residual = vec![0.0f32; padded_dims];
 
             match bits {
                 QuantBits::Four => {
-                    // 3-bit MSE (8 levels) + 1-bit sign = 4 bits per coordinate
-                    // Pack two coordinates per byte: hi nibble + lo nibble
-                    for j in (0..padded_dims).step_by(2) {
-                        let idx_hi = quantize_scalar_3bit(vec[j], &boundaries_3bit);
-                        let residual_hi = vec[j] - centroids_3bit[idx_hi as usize];
-                        let sign_hi: u8 = if residual_hi >= 0.0 { 1 } else { 0 };
-                        total_r_sq += (residual_hi * residual_hi) as f64;
-
-                        let idx_lo = quantize_scalar_3bit(vec[j + 1], &boundaries_3bit);
-                        let residual_lo = vec[j + 1] - centroids_3bit[idx_lo as usize];
-                        let sign_lo: u8 = if residual_lo >= 0.0 { 1 } else { 0 };
-                        total_r_sq += (residual_lo * residual_lo) as f64;
-
-                        // nibble = (3-bit idx << 1) | sign
-                        let hi = (idx_hi << 1) | sign_hi;
-                        let lo = (idx_lo << 1) | sign_lo;
-                        packed.push((hi << 4) | lo);
+                    for j in 0..padded_dims {
+                        let idx = quantize_scalar_3bit(vec[j], &boundaries_3bit);
+                        mse_indices[j] = idx;
+                        residual[j] = vec[j] - centroids_3bit[idx as usize];
+                        total_r_sq += (residual[j] * residual[j]) as f64;
                     }
                 }
                 QuantBits::Eight => {
-                    // 7-bit MSE (128 levels, uniform) + 1-bit sign = 8 bits per coordinate
                     let range = QUANT8_RANGE;
                     for j in 0..padded_dims {
                         let clamped = vec[j].clamp(-range, range);
-                        let idx = ((clamped + range) / (2.0 * range) * 127.0) as u8; // 0..127
+                        let idx = ((clamped + range) / (2.0 * range) * 127.0) as u8;
+                        mse_indices[j] = idx;
                         let dequant = (idx as f32 / 127.0) * 2.0 * range - range;
-                        let residual = vec[j] - dequant;
-                        let sign: u8 = if residual >= 0.0 { 1 } else { 0 };
-                        total_r_sq += (residual * residual) as f64;
-
-                        // byte = (7-bit idx << 1) | sign
-                        packed.push((idx << 1) | sign);
+                        residual[j] = vec[j] - dequant;
+                        total_r_sq += (residual[j] * residual[j]) as f64;
                     }
                 }
             }
 
+            // Stage 2: QJL — project residual through S, take sign
+            // q_j = sign(Σ_k S[j][k] * residual[k])
+            let mut qjl_signs = vec![0u8; padded_dims];
+            for j in 0..padded_dims {
+                let mut z = 0.0f32;
+                for k in 0..padded_dims {
+                    let w = k / 64;
+                    let bit = k % 64;
+                    let s = if (qjl_sign_matrix[j * words_per_row + w] >> bit) & 1 == 1 {
+                        1.0f32
+                    } else {
+                        -1.0f32
+                    };
+                    z += s * residual[k];
+                }
+                qjl_signs[j] = if z >= 0.0 { 1 } else { 0 };
+            }
+
+            // Pack: (MSE index << 1) | qjl_sign
+            match bits {
+                QuantBits::Four => {
+                    for j in (0..padded_dims).step_by(2) {
+                        let hi = (mse_indices[j] << 1) | qjl_signs[j];
+                        let lo = (mse_indices[j + 1] << 1) | qjl_signs[j + 1];
+                        packed.push((hi << 4) | lo);
+                    }
+                }
+                QuantBits::Eight => {
+                    for j in 0..padded_dims {
+                        packed.push((mse_indices[j] << 1) | qjl_signs[j]);
+                    }
+                }
+            }
         }
 
-        // Average MSE per coordinate across all points
         let total_coords = (n_samples * padded_dims) as f64;
         let mse_per_coord = (total_r_sq / total_coords) as f32;
 
@@ -236,6 +275,8 @@ impl QuantizedData {
             packed,
             centroids_3bit,
             quant7_range: QUANT8_RANGE,
+            qjl_sign_matrix,
+            qjl_words_per_row: words_per_row,
             qjl_r_norm_sq_per_coord: mse_per_coord,
         }
     }
