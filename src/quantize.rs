@@ -13,24 +13,21 @@ use rand::Rng;
 ///
 /// This preserves distances with near-optimal distortion guarantees.
 
-/// Precomputed Lloyd-Max codebook for 4-bit quantization (16 levels)
-/// of coordinates following a Beta((d-1)/2, (d-1)/2) distribution,
-/// which for large d approximates N(0, 1/d).
-/// These are the centroids for the standard normal distribution, scaled.
-/// 4-bit Lloyd-Max centroids for N(0,1), from classical quantization theory.
+/// Lloyd-Max codebook for 4-bit MSE quantization (16 levels) of N(0,1)
 const LLOYD_MAX_4BIT_CENTROIDS: [f32; 16] = [
-    -1.7479, -1.2461, -0.9224, -0.6568,
-    -0.4246, -0.2127, -0.0638,  0.0638,
-     0.2127,  0.4246,  0.6568,  0.9224,
-     1.2461,  1.7479,  2.4008, -2.4008,
+    -2.4008, -1.7479, -1.2461, -0.9224, -0.6568, -0.4246, -0.2127, -0.0638,
+     0.0638,  0.2127,  0.4246,  0.6568,  0.9224,  1.2461,  1.7479,  2.4008,
 ];
 
-/// Sorted centroids and decision boundaries for encoding
-fn sorted_codebook() -> ([f32; 16], [f32; 15]) {
-    let mut centroids = LLOYD_MAX_4BIT_CENTROIDS;
-    centroids.sort_by(|a, b| a.partial_cmp(b).unwrap());
+/// Lloyd-Max codebook for 3-bit MSE quantization (8 levels) of N(0,1)
+/// Used in TurboQuant_prod where 1 bit goes to QJL sign
+const LLOYD_MAX_3BIT_CENTROIDS: [f32; 8] = [
+    -1.7479, -1.0500, -0.5006, -0.0638,
+     0.0638,  0.5006,  1.0500,  1.7479,
+];
 
-    // Decision boundaries are midpoints between adjacent centroids
+fn sorted_codebook() -> ([f32; 16], [f32; 15]) {
+    let centroids = LLOYD_MAX_4BIT_CENTROIDS;
     let mut boundaries = [0.0f32; 15];
     for i in 0..15 {
         boundaries[i] = (centroids[i] + centroids[i + 1]) / 2.0;
@@ -38,17 +35,31 @@ fn sorted_codebook() -> ([f32; 16], [f32; 15]) {
     (centroids, boundaries)
 }
 
-/// Quantize a scalar value to 4-bit index using the codebook
+fn sorted_codebook_3bit() -> ([f32; 8], [f32; 7]) {
+    let centroids = LLOYD_MAX_3BIT_CENTROIDS;
+    let mut boundaries = [0.0f32; 7];
+    for i in 0..7 {
+        boundaries[i] = (centroids[i] + centroids[i + 1]) / 2.0;
+    }
+    (centroids, boundaries)
+}
+
+/// Quantize a scalar value to 4-bit index (16 levels)
 #[inline]
 fn quantize_scalar(val: f32, boundaries: &[f32; 15]) -> u8 {
-    // Binary search for the right bucket
     let mut idx = 0u8;
     for (i, &b) in boundaries.iter().enumerate() {
-        if val > b {
-            idx = (i + 1) as u8;
-        } else {
-            break;
-        }
+        if val > b { idx = (i + 1) as u8; } else { break; }
+    }
+    idx
+}
+
+/// Quantize a scalar value to 3-bit index (8 levels)
+#[inline]
+fn quantize_scalar_3bit(val: f32, boundaries: &[f32; 7]) -> u8 {
+    let mut idx = 0u8;
+    for (i, &b) in boundaries.iter().enumerate() {
+        if val > b { idx = (i + 1) as u8; } else { break; }
     }
     idx
 }
@@ -91,59 +102,49 @@ pub enum QuantBits {
     Eight,
 }
 
-/// Quantized vector storage with optional QJL inner product correction
+/// TurboQuant_prod: (b-1)-bit MSE + 1-bit QJL sign per coordinate.
+/// Total bits per coordinate = b (same budget, better inner products).
+///
+/// Packing (4-bit mode): nibble = (3-bit MSE index) << 1 | sign_bit
+/// Packing (8-bit mode): byte  = (7-bit MSE index) << 1 | sign_bit
+///
+/// For inner product: dot ≈ mse_dot + √(π/2)/d · ||r_i|| · ||r_j|| · sign_agreement
+/// sign_agreement = d - 2·hamming(signs_i, signs_j), computed via XOR+popcount.
 pub struct QuantizedData {
-    /// Number of original samples
     pub n_samples: usize,
-    /// Original dimensionality
     pub n_dims: usize,
-    /// Padded dimensionality (power of 2)
     padded_dims: usize,
-    /// Bit-width used
     bits: QuantBits,
     /// Random sign flips for Hadamard randomization
     signs: Vec<f32>,
-    /// Norms of original vectors (for distance reconstruction)
+    /// Norms of original vectors
     norms: Vec<f32>,
-    /// Quantized data storage
+    /// Packed data: each coordinate has (b-1) MSE bits + 1 QJL sign bit
     packed: Vec<u8>,
-    /// Precomputed 4-bit codebook (unused in 8-bit mode)
-    centroids_4bit: [f32; 16],
-    /// 8-bit uniform quantizer range
-    quant8_range: f32,
-    /// QJL: residual norms ||r_i|| per point (None if QJL disabled)
-    qjl_residual_norms: Option<Vec<f32>>,
-    /// QJL: 1-bit sign projections, packed as u64 words
-    /// Layout: [n_samples][ceil(padded_dims/64)] u64 words
-    qjl_signs: Option<Vec<u64>>,
-    /// QJL: random sign matrix for JL projection (padded_dims × padded_dims)
-    /// Stored as packed bits: each row is padded_dims bits = ceil(padded_dims/64) u64s
-    qjl_proj: Option<Vec<u64>>,
-    /// QJL: number of u64 words per point
-    qjl_words_per_point: usize,
+    /// MSE codebook centroids (3-bit for Four, 7-bit uniform for Eight)
+    centroids_3bit: [f32; 8],
+    /// 8-bit: range for 7-bit uniform quantizer
+    quant7_range: f32,
+    /// Residual norms ||r_i|| per point (for QJL correction)
+    residual_norms: Vec<f32>,
 }
 
 /// Range for 8-bit uniform quantizer (covers ~99.7% of N(0,1))
 const QUANT8_RANGE: f32 = 3.5;
 
 impl QuantizedData {
-    /// Quantize with 4-bit + QJL correction (default)
+    /// Quantize with 4-bit TurboQuant_prod (3-bit MSE + 1-bit QJL sign)
     pub fn encode(data: &Array2<f64>, seed: u64) -> Self {
-        Self::encode_with_qjl(data, seed, QuantBits::Four)
+        Self::encode_with_bits(data, seed, QuantBits::Four)
     }
 
-    /// Quantize with specified bit-width + QJL correction
+    /// Quantize with TurboQuant_prod: (b-1)-bit MSE + 1-bit QJL per coordinate
     pub fn encode_with_bits(data: &Array2<f64>, seed: u64, bits: QuantBits) -> Self {
-        Self::encode_with_qjl(data, seed, bits)
-    }
-
-    /// Internal: quantize without QJL (used as first stage of encode_with_qjl)
-    fn encode_mse_only(data: &Array2<f64>, seed: u64, bits: QuantBits) -> Self {
         let n_samples = data.nrows();
         let n_dims = data.ncols();
         let padded_dims = n_dims.next_power_of_two();
 
-        let (centroids_4bit, boundaries_4bit) = sorted_codebook();
+        let (centroids_3bit, boundaries_3bit) = sorted_codebook_3bit();
 
         let mut rng = StdRng::seed_from_u64(seed);
         let signs: Vec<f32> = (0..padded_dims)
@@ -151,6 +152,7 @@ impl QuantizedData {
             .collect();
 
         let mut norms = Vec::with_capacity(n_samples);
+        let mut residual_norms = Vec::with_capacity(n_samples);
         let bytes_per_point = match bits {
             QuantBits::Four => padded_dims / 2,
             QuantBits::Eight => padded_dims,
@@ -167,39 +169,57 @@ impl QuantizedData {
             norms.push(norm);
 
             if norm > f32::EPSILON {
-                for v in vec.iter_mut() {
-                    *v /= norm;
-                }
+                for v in vec.iter_mut() { *v /= norm; }
             }
 
-            for (v, &s) in vec.iter_mut().zip(signs.iter()) {
-                *v *= s;
-            }
-
+            for (v, &s) in vec.iter_mut().zip(signs.iter()) { *v *= s; }
             walsh_hadamard_transform(&mut vec);
-
             let scale = (padded_dims as f32).sqrt();
-            for v in vec.iter_mut() {
-                *v *= scale;
-            }
+            for v in vec.iter_mut() { *v *= scale; }
+
+            // Quantize + compute residual sign (QJL) in one pass
+            // Pack: (b-1)-bit MSE index shifted left by 1, OR'd with sign(residual)
+            let mut r_norm_sq = 0.0f32;
 
             match bits {
                 QuantBits::Four => {
+                    // 3-bit MSE (8 levels) + 1-bit sign = 4 bits per coordinate
+                    // Pack two coordinates per byte: hi nibble + lo nibble
                     for j in (0..padded_dims).step_by(2) {
-                        let hi = quantize_scalar(vec[j], &boundaries_4bit);
-                        let lo = quantize_scalar(vec[j + 1], &boundaries_4bit);
+                        let idx_hi = quantize_scalar_3bit(vec[j], &boundaries_3bit);
+                        let residual_hi = vec[j] - centroids_3bit[idx_hi as usize];
+                        let sign_hi: u8 = if residual_hi >= 0.0 { 1 } else { 0 };
+                        r_norm_sq += residual_hi * residual_hi;
+
+                        let idx_lo = quantize_scalar_3bit(vec[j + 1], &boundaries_3bit);
+                        let residual_lo = vec[j + 1] - centroids_3bit[idx_lo as usize];
+                        let sign_lo: u8 = if residual_lo >= 0.0 { 1 } else { 0 };
+                        r_norm_sq += residual_lo * residual_lo;
+
+                        // nibble = (3-bit idx << 1) | sign
+                        let hi = (idx_hi << 1) | sign_hi;
+                        let lo = (idx_lo << 1) | sign_lo;
                         packed.push((hi << 4) | lo);
                     }
                 }
                 QuantBits::Eight => {
+                    // 7-bit MSE (128 levels, uniform) + 1-bit sign = 8 bits per coordinate
+                    let range = QUANT8_RANGE;
                     for j in 0..padded_dims {
-                        // Uniform quantizer: map [-RANGE, +RANGE] to [0, 255]
-                        let clamped = vec[j].clamp(-QUANT8_RANGE, QUANT8_RANGE);
-                        let normalized = (clamped + QUANT8_RANGE) / (2.0 * QUANT8_RANGE);
-                        packed.push((normalized * 255.0) as u8);
+                        let clamped = vec[j].clamp(-range, range);
+                        let idx = ((clamped + range) / (2.0 * range) * 127.0) as u8; // 0..127
+                        let dequant = (idx as f32 / 127.0) * 2.0 * range - range;
+                        let residual = vec[j] - dequant;
+                        let sign: u8 = if residual >= 0.0 { 1 } else { 0 };
+                        r_norm_sq += residual * residual;
+
+                        // byte = (7-bit idx << 1) | sign
+                        packed.push((idx << 1) | sign);
                     }
                 }
             }
+
+            residual_norms.push(r_norm_sq.sqrt());
         }
 
         Self {
@@ -210,129 +230,14 @@ impl QuantizedData {
             signs,
             norms,
             packed,
-            centroids_4bit,
-            quant8_range: QUANT8_RANGE,
-            qjl_residual_norms: None,
-            qjl_signs: None,
-            qjl_proj: None,
-            qjl_words_per_point: 0,
+            centroids_3bit,
+            quant7_range: QUANT8_RANGE,
+            residual_norms,
         }
     }
 
-    /// Quantize with QJL inner product correction (TurboQuant_prod).
-    /// Stage 1: MSE quantization (random rotation + scalar quantize)
-    /// Stage 2: QJL 1-bit correction on residual for unbiased inner products
-    pub fn encode_with_qjl(data: &Array2<f64>, seed: u64, bits: QuantBits) -> Self {
-        let mut result = Self::encode_mse_only(data, seed, bits);
 
-        let n = result.n_samples;
-        let pd = result.padded_dims;
-        let n_dims = result.n_dims;
-        let words_per_point = (pd + 63) / 64;
-        result.qjl_words_per_point = words_per_point;
-
-        // Generate random JL sign matrix: pd × pd bits
-        // Each row j has pd random ±1 entries, stored as packed bits (1 = +1, 0 = -1)
-        let mut rng = StdRng::seed_from_u64(seed.wrapping_add(0x514A4C)) ; // "QJL" in hex
-        let mut proj = vec![0u64; pd * words_per_point];
-        for j in 0..pd {
-            for w in 0..words_per_point {
-                let mut word = 0u64;
-                for bit in 0..64 {
-                    if w * 64 + bit < pd {
-                        if rng.gen_range(0.0f32..1.0) < 0.5 { word |= 1u64 << bit; }
-                    }
-                }
-                proj[j * words_per_point + w] = word;
-            }
-        }
-
-        // For each point: compute residual in rotated space, project, sign-quantize
-        let (centroids, boundaries) = sorted_codebook();
-        let mut residual_norms = Vec::with_capacity(n);
-        let mut all_signs = Vec::with_capacity(n * words_per_point);
-
-        for i in 0..n {
-            // Reconstruct the rotated+scaled quantized vector
-            let mut rotated = vec![0.0f32; pd];
-            let mut dequant = vec![0.0f32; pd];
-
-            // Get original rotated vector (re-do the transform)
-            let mut vec = vec![0.0f32; pd];
-            for j in 0..n_dims {
-                vec[j] = data[[i, j]] as f32;
-            }
-            let norm = result.norms[i];
-            if norm > f32::EPSILON {
-                for v in vec.iter_mut() { *v /= norm; }
-            }
-            for (v, &s) in vec.iter_mut().zip(result.signs.iter()) { *v *= s; }
-            walsh_hadamard_transform(&mut vec);
-            let scale = (pd as f32).sqrt();
-            for v in vec.iter_mut() { *v *= scale; }
-            rotated.copy_from_slice(&vec);
-
-            // Dequantize
-            match bits {
-                QuantBits::Four => {
-                    let bpp = pd / 2;
-                    let offset = i * bpp;
-                    for j in 0..bpp {
-                        let byte = result.packed[offset + j];
-                        dequant[j * 2] = dequantize_scalar((byte >> 4) & 0x0F, &centroids);
-                        dequant[j * 2 + 1] = dequantize_scalar(byte & 0x0F, &centroids);
-                    }
-                }
-                QuantBits::Eight => {
-                    let offset = i * pd;
-                    let qscale = 2.0 * QUANT8_RANGE / 255.0;
-                    for j in 0..pd {
-                        dequant[j] = result.packed[offset + j] as f32 * qscale - QUANT8_RANGE;
-                    }
-                }
-            }
-
-            // Residual: r = rotated - dequant
-            let mut residual = vec![0.0f32; pd];
-            let mut r_norm_sq = 0.0f32;
-            for j in 0..pd {
-                residual[j] = rotated[j] - dequant[j];
-                r_norm_sq += residual[j] * residual[j];
-            }
-            residual_norms.push(r_norm_sq.sqrt());
-
-            // Project residual: z_j = sum_k S[j][k] * residual[k]
-            // Then store sign(z_j) as 1 bit
-            let mut point_signs = vec![0u64; words_per_point];
-            for j in 0..pd {
-                let mut z = 0.0f32;
-                for k in 0..pd {
-                    let w = k / 64;
-                    let bit = k % 64;
-                    let s = if (proj[j * words_per_point + w] >> bit) & 1 == 1 { 1.0f32 } else { -1.0f32 };
-                    z += s * residual[k];
-                }
-                // Store sign(z): 1 if z >= 0, 0 if z < 0
-                if z >= 0.0 {
-                    let w = j / 64;
-                    let bit = j % 64;
-                    point_signs[w] |= 1u64 << bit;
-                }
-            }
-            all_signs.extend_from_slice(&point_signs);
-        }
-
-        result.qjl_residual_norms = Some(residual_norms);
-        result.qjl_signs = Some(all_signs);
-        result.qjl_proj = Some(proj);
-
-        eprintln!("QJL: {} extra bytes/point ({} bits signs + 4 bytes norm)",
-                  words_per_point * 8 + 4, pd);
-
-        result
-    }
-
-    /// Dequantize a single vector to f32
+    /// Dequantize a single vector to f32 (MSE part only, ignoring QJL sign)
     pub fn decode(&self, idx: usize) -> Vec<f32> {
         let bpp = self.bytes_per_point();
         let offset = idx * bpp;
@@ -340,18 +245,21 @@ impl QuantizedData {
         let mut vec = vec![0.0f32; self.padded_dims];
         match self.bits {
             QuantBits::Four => {
+                // nibble = (3-bit idx << 1) | sign_bit
                 for j in 0..self.padded_dims / 2 {
                     let byte = self.packed[offset + j];
-                    let hi = (byte >> 4) & 0x0F;
-                    let lo = byte & 0x0F;
-                    vec[j * 2] = dequantize_scalar(hi, &self.centroids_4bit);
-                    vec[j * 2 + 1] = dequantize_scalar(lo, &self.centroids_4bit);
+                    let hi_idx = ((byte >> 4) & 0x0F) >> 1; // top 3 bits of hi nibble
+                    let lo_idx = (byte & 0x0F) >> 1;         // top 3 bits of lo nibble
+                    vec[j * 2] = self.centroids_3bit[hi_idx as usize];
+                    vec[j * 2 + 1] = self.centroids_3bit[lo_idx as usize];
                 }
             }
             QuantBits::Eight => {
-                let scale = 2.0 * self.quant8_range / 255.0;
+                // byte = (7-bit idx << 1) | sign_bit
+                let range = self.quant7_range;
                 for j in 0..self.padded_dims {
-                    vec[j] = self.packed[offset + j] as f32 * scale - self.quant8_range;
+                    let idx = self.packed[offset + j] >> 1; // top 7 bits
+                    vec[j] = (idx as f32 / 127.0) * 2.0 * range - range;
                 }
             }
         }
@@ -381,66 +289,71 @@ impl QuantizedData {
 
     /// Compute approximate squared Euclidean distance between two quantized vectors.
     /// Works directly on quantized representation without full dequantization.
+    /// Approximate squared Euclidean distance with QJL-corrected inner product.
+    /// MSE dot product + sign agreement correction, all from the packed data.
     pub fn approx_dist_sq(&self, i: usize, j: usize) -> f32 {
         let ni = self.norms[i];
         let nj = self.norms[j];
 
-        let dot = match self.bits {
+        let (mse_dot, sign_disagree) = match self.bits {
             QuantBits::Four => {
                 let bpp = self.padded_dims / 2;
-                let offset_i = i * bpp;
-                let offset_j = j * bpp;
+                let off_i = i * bpp;
+                let off_j = j * bpp;
                 let mut dot = 0.0f32;
+                let mut disagree = 0u32;
                 for k in 0..bpp {
-                    let bi = self.packed[offset_i + k];
-                    let bj = self.packed[offset_j + k];
-                    let vi_0 = dequantize_scalar((bi >> 4) & 0x0F, &self.centroids_4bit);
-                    let vi_1 = dequantize_scalar(bi & 0x0F, &self.centroids_4bit);
-                    let vj_0 = dequantize_scalar((bj >> 4) & 0x0F, &self.centroids_4bit);
-                    let vj_1 = dequantize_scalar(bj & 0x0F, &self.centroids_4bit);
-                    dot += vi_0 * vj_0 + vi_1 * vj_1;
+                    let bi = self.packed[off_i + k];
+                    let bj = self.packed[off_j + k];
+                    // Hi nibble: (3-bit idx << 1) | sign
+                    let idx_i_hi = ((bi >> 4) & 0x0F) >> 1;
+                    let idx_j_hi = ((bj >> 4) & 0x0F) >> 1;
+                    let sign_i_hi = (bi >> 4) & 1;
+                    let sign_j_hi = (bj >> 4) & 1;
+                    dot += self.centroids_3bit[idx_i_hi as usize] * self.centroids_3bit[idx_j_hi as usize];
+                    disagree += (sign_i_hi ^ sign_j_hi) as u32;
+                    // Lo nibble
+                    let idx_i_lo = (bi & 0x0F) >> 1;
+                    let idx_j_lo = (bj & 0x0F) >> 1;
+                    let sign_i_lo = bi & 1;
+                    let sign_j_lo = bj & 1;
+                    dot += self.centroids_3bit[idx_i_lo as usize] * self.centroids_3bit[idx_j_lo as usize];
+                    disagree += (sign_i_lo ^ sign_j_lo) as u32;
                 }
-                dot
+                (dot, disagree)
             }
             QuantBits::Eight => {
                 let bpp = self.padded_dims;
-                let offset_i = i * bpp;
-                let offset_j = j * bpp;
+                let off_i = i * bpp;
+                let off_j = j * bpp;
                 let mut dot = 0.0f32;
-                let scale = 2.0 * self.quant8_range / 255.0;
+                let mut disagree = 0u32;
+                let range = self.quant7_range;
                 for k in 0..bpp {
-                    let vi = self.packed[offset_i + k] as f32 * scale - self.quant8_range;
-                    let vj = self.packed[offset_j + k] as f32 * scale - self.quant8_range;
+                    let bi = self.packed[off_i + k];
+                    let bj = self.packed[off_j + k];
+                    // byte = (7-bit idx << 1) | sign
+                    let idx_i = bi >> 1;
+                    let idx_j = bj >> 1;
+                    let sign_i = bi & 1;
+                    let sign_j = bj & 1;
+                    let vi = (idx_i as f32 / 127.0) * 2.0 * range - range;
+                    let vj = (idx_j as f32 / 127.0) * 2.0 * range - range;
                     dot += vi * vj;
+                    disagree += (sign_i ^ sign_j) as u32;
                 }
-                dot
+                (dot, disagree)
             }
         };
 
-        // QJL correction: unbiased inner product via residual sign agreement
-        // <r_i, r_j> ≈ (sqrt(π/2) / d) · ||r_i|| · ||r_j|| · (d - 2·hamming(signs_i, signs_j))
-        let qjl_correction = {
-            let r_norms = self.qjl_residual_norms.as_ref().unwrap();
-            let signs = self.qjl_signs.as_ref().unwrap();
-            let wpp = self.qjl_words_per_point;
-            let off_i = i * wpp;
-            let off_j = j * wpp;
+        // QJL correction: sqrt(π/2)/d · ||r_i|| · ||r_j|| · (d - 2·hamming)
+        let d = self.padded_dims as f32;
+        let agreement = d - 2.0 * sign_disagree as f32;
+        const SQRT_PI_OVER_2: f32 = 1.2533141;
+        let qjl = SQRT_PI_OVER_2 / d * self.residual_norms[i] * self.residual_norms[j] * agreement;
 
-            // XOR + popcount = Hamming distance (number of disagreeing bits)
-            let mut xor_popcount = 0u32;
-            for w in 0..wpp {
-                xor_popcount += (signs[off_i + w] ^ signs[off_j + w]).count_ones();
-            }
-            let d = self.padded_dims as f32;
-            // agreement ∈ [-d, +d]: positive means similar residuals
-            let agreement = d - 2.0 * xor_popcount as f32;
-
-            const SQRT_PI_OVER_2: f32 = 1.2533141;
-            SQRT_PI_OVER_2 / d * r_norms[i] * r_norms[j] * agreement
-        };
-
-        let corrected_dot = dot + qjl_correction;
-        let inv_d = 1.0 / self.padded_dims as f32;
+        let corrected_dot = mse_dot + qjl;
+        let inv_d = 1.0 / d;
         let cos_theta = (corrected_dot * inv_d).clamp(-1.0, 1.0);
         ni * ni + nj * nj - 2.0 * ni * nj * cos_theta
     }
@@ -477,7 +390,8 @@ impl QuantizedData {
 
     /// Get sorted codebook centroids (for GPU upload)
     pub fn sorted_centroids(&self) -> Vec<f32> {
-        self.centroids_4bit.to_vec()
+        // GPU kernel needs the 3-bit codebook for TQ4 mode
+        self.centroids_3bit.to_vec()
     }
 }
 
