@@ -123,6 +123,124 @@ fn compute_knn_dists(
     knn_dists
 }
 
+/// Compact P matrix: CSR format with f32 values and u32 column indices.
+/// At 1M points: ~600 MB vs ~3.6 GB for COO triplets.
+pub struct CompactP {
+    /// Row offsets: length n+1
+    pub row_offsets: Vec<u32>,
+    /// Column indices
+    pub col_indices: Vec<u32>,
+    /// Symmetrized P values (f32 for memory)
+    pub values: Vec<f32>,
+}
+
+impl CompactP {
+    pub fn from_triplets(n: usize, rows: &[usize], cols: &[usize], vals: &[f64]) -> Self {
+        // Count entries per row
+        let mut counts = vec![0u32; n];
+        for &r in rows { counts[r] += 1; }
+
+        let mut row_offsets = vec![0u32; n + 1];
+        for i in 0..n { row_offsets[i + 1] = row_offsets[i] + counts[i]; }
+        let nnz = row_offsets[n] as usize;
+
+        let mut col_indices = vec![0u32; nnz];
+        let mut values = vec![0.0f32; nnz];
+        let mut pos = row_offsets[..n].to_vec(); // current insertion position per row
+
+        for idx in 0..rows.len() {
+            let r = rows[idx];
+            let p = pos[r] as usize;
+            col_indices[p] = cols[idx] as u32;
+            values[p] = vals[idx] as f32;
+            pos[r] += 1;
+        }
+
+        Self { row_offsets, col_indices, values }
+    }
+
+    pub fn memory_bytes(&self) -> usize {
+        self.row_offsets.len() * 4 + self.col_indices.len() * 4 + self.values.len() * 4
+    }
+}
+
+/// t-SNE with Barnes-Hut O(n log n) approximation, compact P matrix
+pub fn tsne_optimize_bh_compact(
+    embedding: &mut Array2<f64>,
+    p: &CompactP,
+    n_iter: usize,
+    learning_rate: f64,
+    early_exaggeration: f64,
+    early_exaggeration_iter: usize,
+    theta: f64,
+) {
+    let n = embedding.nrows();
+    let mut gains_x = vec![1.0f64; n];
+    let mut gains_y = vec![1.0f64; n];
+    let mut vel_x = vec![0.0f64; n];
+    let mut vel_y = vec![0.0f64; n];
+
+    let mut ex = vec![0.0f64; n];
+    let mut ey = vec![0.0f64; n];
+
+    for iter in 0..n_iter {
+        let momentum = if iter < 250 { 0.5 } else { 0.8 };
+        let exag = if iter < early_exaggeration_iter { early_exaggeration as f32 } else { 1.0f32 };
+
+        for i in 0..n { ex[i] = embedding[[i, 0]]; ey[i] = embedding[[i, 1]]; }
+
+        let tree = QuadTree::build(&ex, &ey);
+        let (rep_fx, rep_fy, z_sum) = tree.compute_repulsion(&ex, &ey, theta);
+
+        let z_inv = 1.0 / z_sum.max(1e-20);
+        let mut grad_x = vec![0.0f64; n];
+        let mut grad_y = vec![0.0f64; n];
+
+        for i in 0..n {
+            grad_x[i] = -4.0 * z_inv * rep_fx[i];
+            grad_y[i] = -4.0 * z_inv * rep_fy[i];
+        }
+
+        // Attractive from compact CSR
+        for i in 0..n {
+            let start = p.row_offsets[i] as usize;
+            let end = p.row_offsets[i + 1] as usize;
+            let xi = ex[i];
+            let yi = ey[i];
+            for idx in start..end {
+                let j = p.col_indices[idx] as usize;
+                let pv = p.values[idx] as f64 * exag as f64;
+                let dx = xi - ex[j];
+                let dy = yi - ey[j];
+                let q = 1.0 / (1.0 + dx * dx + dy * dy);
+                let mult = 4.0 * pv * q;
+                grad_x[i] += mult * dx;
+                grad_y[i] += mult * dy;
+            }
+        }
+
+        for i in 0..n {
+            let gx = grad_x[i];
+            let gy = grad_y[i];
+            if (gx > 0.0) != (vel_x[i] > 0.0) { gains_x[i] = (gains_x[i] + 0.2).min(10.0); }
+            else { gains_x[i] = (gains_x[i] * 0.8).max(0.01); }
+            if (gy > 0.0) != (vel_y[i] > 0.0) { gains_y[i] = (gains_y[i] + 0.2).min(10.0); }
+            else { gains_y[i] = (gains_y[i] * 0.8).max(0.01); }
+            vel_x[i] = momentum * vel_x[i] - learning_rate * gains_x[i] * gx;
+            vel_y[i] = momentum * vel_y[i] - learning_rate * gains_y[i] * gy;
+            embedding[[i, 0]] += vel_x[i];
+            embedding[[i, 1]] += vel_y[i];
+        }
+
+        let mean_x = embedding.column(0).sum() / n as f64;
+        let mean_y = embedding.column(1).sum() / n as f64;
+        for i in 0..n {
+            embedding[[i, 0]] -= mean_x;
+            embedding[[i, 1]] -= mean_y;
+        }
+    }
+}
+
 /// t-SNE with Barnes-Hut O(n log n) approximation
 pub fn tsne_optimize_bh(
     embedding: &mut Array2<f64>,
@@ -348,16 +466,21 @@ pub fn run_tsne(
     // Scale down for t-SNE (typical initial scale ~0.01)
     embedding.mapv_inplace(|x| x * 0.01);
 
+    // Compact P matrix
+    let compact = CompactP::from_triplets(n, &p_rows, &p_cols, &p_vals);
+    eprintln!("  P matrix: {} MB (compact CSR)", compact.memory_bytes() / 1024 / 1024);
+    drop(p_rows); drop(p_cols); drop(p_vals);
+
     // Optimize with Barnes-Hut
     eprintln!("  Optimizing ({} iterations, Barnes-Hut theta=0.5)...", n_iter);
-    tsne_optimize_bh(
+    tsne_optimize_bh_compact(
         &mut embedding,
-        &p_rows, &p_cols, &p_vals,
+        &compact,
         n_iter,
         learning_rate,
         12.0,
         250,
-        0.5,    // Barnes-Hut theta
+        0.5,
     );
 
     embedding
@@ -387,7 +510,10 @@ pub fn run_tsne_compressed(
     let (p_rows, p_cols, p_vals) = compute_p_matrix_compressed(&knn, qdata, perplexity);
     eprintln!("  {} non-zero P entries", p_rows.len());
 
-    // Drop knn — no longer needed
+    // Compact P + drop intermediates
+    let compact = CompactP::from_triplets(n, &p_rows, &p_cols, &p_vals);
+    eprintln!("  P matrix: {} MB (compact CSR)", compact.memory_bytes() / 1024 / 1024);
+    drop(p_rows); drop(p_cols); drop(p_vals);
     drop(knn);
 
     // PCA init
@@ -397,9 +523,9 @@ pub fn run_tsne_compressed(
 
     // Optimize
     eprintln!("  Optimizing ({} iterations, Barnes-Hut theta=0.5)...", n_iter);
-    tsne_optimize_bh(
+    tsne_optimize_bh_compact(
         &mut embedding,
-        &p_rows, &p_cols, &p_vals,
+        &compact,
         n_iter,
         learning_rate,
         12.0,
