@@ -126,11 +126,9 @@ pub struct QuantizedData {
     centroids_3bit: [f32; 8],
     /// 8-bit: range for 7-bit uniform quantizer
     quant7_range: f32,
-    /// QJL: random sign matrix S for residual projection (d × d, packed bits)
-    /// S[j][k] = +1 if bit set, -1 otherwise. Stored as d rows of ceil(d/64) u64 words.
-    qjl_sign_matrix: Vec<u64>,
-    /// Number of u64 words per row of S
-    qjl_words_per_row: usize,
+    /// QJL: random signs for second Hadamard rotation (Stage 2 projection)
+    /// S = diag(qjl_signs) · WHT — orthogonal, S·S^T = I exactly
+    qjl_rotation_signs: Vec<f32>,
     /// QJL: global ||r||² per coordinate (constant approximation after WHT)
     qjl_r_norm_sq_per_coord: f32,
 }
@@ -158,22 +156,12 @@ impl QuantizedData {
             .map(|_| { let v: f32 = rng.gen_range(0.0..1.0); if v < 0.5 { 1.0 } else { -1.0 } })
             .collect();
 
-        // Stage 2 QJL: generate separate random sign matrix S (d × d)
-        // S[j][k] = ±1 random, stored as packed bits
+        // Stage 2 QJL: second randomized Hadamard as orthogonal projection S
+        // Different random signs than Stage 1, same WHT → orthogonal, S·S^T = I exactly
         let mut qjl_rng = StdRng::seed_from_u64(seed.wrapping_add(0x514A4C));
-        let words_per_row = (padded_dims + 63) / 64;
-        let mut qjl_sign_matrix = vec![0u64; padded_dims * words_per_row];
-        for j in 0..padded_dims {
-            for w in 0..words_per_row {
-                let mut word = 0u64;
-                for bit in 0..64 {
-                    if w * 64 + bit < padded_dims {
-                        if qjl_rng.gen_range(0.0f32..1.0) < 0.5 { word |= 1u64 << bit; }
-                    }
-                }
-                qjl_sign_matrix[j * words_per_row + w] = word;
-            }
-        }
+        let qjl_signs: Vec<f32> = (0..padded_dims)
+            .map(|_| { let v: f32 = qjl_rng.gen_range(0.0..1.0); if v < 0.5 { 1.0 } else { -1.0 } })
+            .collect();
 
         let mut norms = Vec::with_capacity(n_samples);
         let mut total_r_sq = 0.0f64;
@@ -227,36 +215,30 @@ impl QuantizedData {
                 }
             }
 
-            // Stage 2: QJL — project residual through S, take sign
-            // q_j = sign(Σ_k S[j][k] * residual[k])
-            let mut qjl_signs = vec![0u8; padded_dims];
+            // Stage 2: QJL — project residual through randomized Hadamard S
+            // S = diag(qjl_signs) · WHT — orthogonal, so S·S^T = I exactly
+            // q = sign(S · residual)
+            let mut projected = residual.clone();
+            for (v, &s) in projected.iter_mut().zip(qjl_signs.iter()) { *v *= s; }
+            walsh_hadamard_transform(&mut projected);
+
+            let mut qjl_sign_bits = vec![0u8; padded_dims];
             for j in 0..padded_dims {
-                let mut z = 0.0f32;
-                for k in 0..padded_dims {
-                    let w = k / 64;
-                    let bit = k % 64;
-                    let s = if (qjl_sign_matrix[j * words_per_row + w] >> bit) & 1 == 1 {
-                        1.0f32
-                    } else {
-                        -1.0f32
-                    };
-                    z += s * residual[k];
-                }
-                qjl_signs[j] = if z >= 0.0 { 1 } else { 0 };
+                qjl_sign_bits[j] = if projected[j] >= 0.0 { 1 } else { 0 };
             }
 
             // Pack: (MSE index << 1) | qjl_sign
             match bits {
                 QuantBits::Four => {
                     for j in (0..padded_dims).step_by(2) {
-                        let hi = (mse_indices[j] << 1) | qjl_signs[j];
-                        let lo = (mse_indices[j + 1] << 1) | qjl_signs[j + 1];
+                        let hi = (mse_indices[j] << 1) | qjl_sign_bits[j];
+                        let lo = (mse_indices[j + 1] << 1) | qjl_sign_bits[j + 1];
                         packed.push((hi << 4) | lo);
                     }
                 }
                 QuantBits::Eight => {
                     for j in 0..padded_dims {
-                        packed.push((mse_indices[j] << 1) | qjl_signs[j]);
+                        packed.push((mse_indices[j] << 1) | qjl_sign_bits[j]);
                     }
                 }
             }
@@ -275,8 +257,7 @@ impl QuantizedData {
             packed,
             centroids_3bit,
             quant7_range: QUANT8_RANGE,
-            qjl_sign_matrix,
-            qjl_words_per_row: words_per_row,
+            qjl_rotation_signs: qjl_signs,
             qjl_r_norm_sq_per_coord: mse_per_coord,
         }
     }
@@ -392,17 +373,17 @@ impl QuantizedData {
         };
 
         // QJL correction for inner product of two reconstructions:
-        //   <x̃_qjl_x, x̃_qjl_y> = (√(π/2)/d)² · q_x^T·S·S^T·q_y
-        //                        = (π/2)/d² · d · <q_x, q_y>   (since S·S^T ≈ d·I)
-        //                        = (π/2)/d · sign_agreement
-        // Full: ||r_x||·||r_y|| · (π/2)/d · sign_agreement
+        //   <x̃_qjl_x, x̃_qjl_y> = (√(π/2)/d)² · q_x^T · S · S^T · q_y
+        //   S is orthogonal (randomized Hadamard): S·S^T = I
+        //   = (π/2)/d² · <q_x, q_y>
+        // Full: ||r_x||·||r_y|| · (π/2)/d² · sign_agreement
         // With ||r_x||·||r_y|| ≈ d · mse_per_coord:
-        //   = mse_per_coord · (π/2) · sign_agreement
+        //   = mse_per_coord · (π/2)/d · sign_agreement
         let d = self.padded_dims as f32;
         let agreement = d - 2.0 * sign_disagree as f32;
-        const PI_OVER_2: f32 = 1.5707964; // (√(π/2))² = π/2
+        const PI_OVER_2: f32 = 1.5707964;
         let r_norm_product = d * self.qjl_r_norm_sq_per_coord;
-        let qjl = PI_OVER_2 / d * r_norm_product * agreement;
+        let qjl = PI_OVER_2 / (d * d) * r_norm_product * agreement;
 
         let corrected_dot = mse_dot + qjl;
         let inv_d = 1.0 / d;

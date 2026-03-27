@@ -51,7 +51,10 @@ extern "C" __global__ void tq4_dot(
     float padded_d = (float)(d_half * 2);
     float mse_per_coord = cb[8]; // stored in codebook slot 8
     float agreement = padded_d - 2.0f * (float)sign_disagree;
-    float qjl = 1.5707964f * mse_per_coord * agreement; // pi/2 * mse * agreement
+    // QJL correction: (π/2)/d² · ||r_i||·||r_j|| · agreement
+    // With ||r||² ≈ d·mse: (π/2)/d² · d·mse · agreement = (π/2)/d · mse · agreement
+    // Note: GPU kernel uses sign(residual) directly (no WHT projection yet)
+    float qjl = 1.5707964f / padded_d * mse_per_coord * agreement;
     C[i * n + j] = dot + qjl;
 }
 
