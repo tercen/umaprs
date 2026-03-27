@@ -125,8 +125,10 @@ pub struct QuantizedData {
     centroids_3bit: [f32; 8],
     /// 8-bit: range for 7-bit uniform quantizer
     quant7_range: f32,
-    /// Residual norms ||r_i|| per point (for QJL correction)
-    residual_norms: Vec<f32>,
+    /// QJL: global ||r||² per coordinate (constant for all points after WHT)
+    /// The Hadamard rotation makes all coordinates ~N(0,1), so quantization
+    /// MSE is the same for every point. ||r_i||·||r_j|| ≈ d·mse_per_coord.
+    qjl_r_norm_sq_per_coord: f32,
 }
 
 /// Range for 8-bit uniform quantizer (covers ~99.7% of N(0,1))
@@ -152,7 +154,7 @@ impl QuantizedData {
             .collect();
 
         let mut norms = Vec::with_capacity(n_samples);
-        let mut residual_norms = Vec::with_capacity(n_samples);
+        let mut total_r_sq = 0.0f64; // accumulate residual² across all coords and points
         let bytes_per_point = match bits {
             QuantBits::Four => padded_dims / 2,
             QuantBits::Eight => padded_dims,
@@ -179,7 +181,6 @@ impl QuantizedData {
 
             // Quantize + compute residual sign (QJL) in one pass
             // Pack: (b-1)-bit MSE index shifted left by 1, OR'd with sign(residual)
-            let mut r_norm_sq = 0.0f32;
 
             match bits {
                 QuantBits::Four => {
@@ -189,12 +190,12 @@ impl QuantizedData {
                         let idx_hi = quantize_scalar_3bit(vec[j], &boundaries_3bit);
                         let residual_hi = vec[j] - centroids_3bit[idx_hi as usize];
                         let sign_hi: u8 = if residual_hi >= 0.0 { 1 } else { 0 };
-                        r_norm_sq += residual_hi * residual_hi;
+                        total_r_sq += (residual_hi * residual_hi) as f64;
 
                         let idx_lo = quantize_scalar_3bit(vec[j + 1], &boundaries_3bit);
                         let residual_lo = vec[j + 1] - centroids_3bit[idx_lo as usize];
                         let sign_lo: u8 = if residual_lo >= 0.0 { 1 } else { 0 };
-                        r_norm_sq += residual_lo * residual_lo;
+                        total_r_sq += (residual_lo * residual_lo) as f64;
 
                         // nibble = (3-bit idx << 1) | sign
                         let hi = (idx_hi << 1) | sign_hi;
@@ -211,7 +212,7 @@ impl QuantizedData {
                         let dequant = (idx as f32 / 127.0) * 2.0 * range - range;
                         let residual = vec[j] - dequant;
                         let sign: u8 = if residual >= 0.0 { 1 } else { 0 };
-                        r_norm_sq += residual * residual;
+                        total_r_sq += (residual * residual) as f64;
 
                         // byte = (7-bit idx << 1) | sign
                         packed.push((idx << 1) | sign);
@@ -219,8 +220,11 @@ impl QuantizedData {
                 }
             }
 
-            residual_norms.push(r_norm_sq.sqrt());
         }
+
+        // Average MSE per coordinate across all points
+        let total_coords = (n_samples * padded_dims) as f64;
+        let mse_per_coord = (total_r_sq / total_coords) as f32;
 
         Self {
             n_samples,
@@ -232,7 +236,7 @@ impl QuantizedData {
             packed,
             centroids_3bit,
             quant7_range: QUANT8_RANGE,
-            residual_norms,
+            qjl_r_norm_sq_per_coord: mse_per_coord,
         }
     }
 
@@ -346,11 +350,14 @@ impl QuantizedData {
             }
         };
 
-        // QJL correction: sqrt(π/2)/d · ||r_i|| · ||r_j|| · (d - 2·hamming)
+        // QJL correction: sqrt(π/2)/d · ||r_i|| · ||r_j|| · sign_agreement
+        // Since ||r_i|| ≈ ||r_j|| ≈ sqrt(d · mse_per_coord) for all points:
+        // ||r_i||·||r_j|| ≈ d · mse_per_coord
         let d = self.padded_dims as f32;
         let agreement = d - 2.0 * sign_disagree as f32;
         const SQRT_PI_OVER_2: f32 = 1.2533141;
-        let qjl = SQRT_PI_OVER_2 / d * self.residual_norms[i] * self.residual_norms[j] * agreement;
+        let r_norm_product = d * self.qjl_r_norm_sq_per_coord; // ||r_i||·||r_j|| ≈ d·MSE
+        let qjl = SQRT_PI_OVER_2 / d * r_norm_product * agreement;
 
         let corrected_dot = mse_dot + qjl;
         let inv_d = 1.0 / d;
