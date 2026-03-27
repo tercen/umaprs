@@ -43,12 +43,8 @@ pub enum KnnMethod {
     BruteForce,
     KdTree,
     Hnsw,
-    /// GPU brute-force via cuBLAS (requires 'cuda' feature)
+    /// GPU brute-force (requires 'cuda' feature)
     Gpu,
-    /// GPU TQ4: packed 4-bit dot products via CUDA kernel (16x less GPU memory)
-    GpuTQ4,
-    /// GPU TQ8: packed 8-bit dot products via CUDA kernel (8x less GPU memory)
-    GpuTQ8,
 }
 
 /// Model export format
@@ -160,8 +156,6 @@ impl UMAP {
             KnnMethod::KdTree => knn::compute_knn_kdtree(data, k),
             KnnMethod::Hnsw => compute_knn_hnsw_f32(data, k),
             KnnMethod::Gpu => gpu::compute_knn_gpu(data, k),
-            KnnMethod::GpuTQ4 => gpu::compute_knn_gpu_tq4(data, k),
-            KnnMethod::GpuTQ8 => gpu::compute_knn_gpu_tq8(data, k),
         }
     }
 
