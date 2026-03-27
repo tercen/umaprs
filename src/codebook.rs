@@ -73,8 +73,9 @@ pub fn solve_lloyd_max(d: usize, n_levels: usize) -> (Vec<f32>, Vec<f32>) {
         .map(|i| lo + (hi - lo) * (i as f64 + 0.5) / n_levels as f64)
         .collect();
 
-    // Gauss-Legendre quadrature with 32 points (more than enough for smooth PDFs)
-    let quad = GaussLegendre::new(32).unwrap();
+    // Gauss-Legendre quadrature — more points for higher level counts
+    let quad_degree = if n_levels <= 128 { 32 } else { 128 };
+    let quad = GaussLegendre::new(quad_degree).unwrap();
 
     let pdf = |x: f64| beta_pdf(x, d);
 

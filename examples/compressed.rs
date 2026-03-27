@@ -42,4 +42,10 @@ fn main() {
     let emb = umap.fit_transform_compressed(&data, QuantBits::Eight);
     println!("Compressed TQ8:       {:.3}s", t.elapsed().as_secs_f64());
     save(&emb, "results/cyto_emb_compressed_tq8.csv");
+
+    // Compressed TQ12
+    let t = Instant::now();
+    let emb = umap.fit_transform_compressed(&data, QuantBits::Twelve);
+    println!("Compressed TQ12:      {:.3}s", t.elapsed().as_secs_f64());
+    save(&emb, "results/cyto_emb_compressed_tq12.csv");
 }

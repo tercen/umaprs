@@ -43,10 +43,10 @@ fn solve_lloyd_max_n01_uncached(n_levels: usize) -> (Vec<f32>, Vec<f32>) {
 
 /// Quantize a scalar value to the nearest centroid index
 #[inline]
-fn quantize_scalar_dynamic(val: f32, boundaries: &[f32]) -> u8 {
-    let mut idx = 0u8;
+fn quantize_scalar_dynamic(val: f32, boundaries: &[f32]) -> u16 {
+    let mut idx = 0u16;
     for (i, &b) in boundaries.iter().enumerate() {
-        if val > b { idx = (i + 1) as u8; } else { break; }
+        if val > b { idx = (i + 1) as u16; } else { break; }
     }
     idx
 }
@@ -87,6 +87,7 @@ fn walsh_hadamard_transform(data: &mut [f32]) {
 pub enum QuantBits {
     Four,
     Eight,
+    Twelve,
 }
 
 /// TurboQuant_prod: (b-1)-bit MSE + 1-bit QJL sign per coordinate.
@@ -142,8 +143,9 @@ impl QuantizedData {
         // exact Beta distribution in the Gaussian limit.
         // The codebook is the same for all d since our scaling normalizes to N(0,1).
         let (centroids, boundaries) = solve_lloyd_max_n01(match bits {
-            QuantBits::Four => 8,   // 3-bit MSE = 8 levels
-            QuantBits::Eight => 128, // 7-bit MSE = 128 levels
+            QuantBits::Four => 8,     // 3-bit MSE = 8 levels
+            QuantBits::Eight => 128,  // 7-bit MSE = 128 levels
+            QuantBits::Twelve => 2048, // 11-bit MSE = 2048 levels
         });
 
         // Stage 1 rotation: random sign flips for Hadamard
@@ -165,6 +167,7 @@ impl QuantizedData {
         let bytes_per_point = match bits {
             QuantBits::Four => padded_dims / 2,
             QuantBits::Eight => padded_dims,
+            QuantBits::Twelve => padded_dims * 2, // u16 per coord = 2 bytes
         };
         let mut packed = Vec::with_capacity(n_samples * bytes_per_point);
 
@@ -187,26 +190,14 @@ impl QuantizedData {
             for v in vec.iter_mut() { *v *= scale; }
 
             // Stage 1: MSE quantize + compute residual per coordinate
-            let mut mse_indices = vec![0u8; padded_dims];
+            let mut mse_indices = vec![0u16; padded_dims];
             let mut residual = vec![0.0f32; padded_dims];
 
-            match bits {
-                QuantBits::Four => {
-                    for j in 0..padded_dims {
-                        let idx = quantize_scalar_dynamic(vec[j], &boundaries);
-                        mse_indices[j] = idx;
-                        residual[j] = vec[j] - centroids[idx as usize];
-                        total_r_sq += (residual[j] * residual[j]) as f64;
-                    }
-                }
-                QuantBits::Eight => {
-                    for j in 0..padded_dims {
-                        let idx = quantize_scalar_dynamic(vec[j], &boundaries);
-                        mse_indices[j] = idx;
-                        residual[j] = vec[j] - centroids[idx as usize];
-                        total_r_sq += (residual[j] * residual[j]) as f64;
-                    }
-                }
+            for j in 0..padded_dims {
+                let idx = quantize_scalar_dynamic(vec[j], &boundaries);
+                mse_indices[j] = idx as u16;
+                residual[j] = vec[j] - centroids[idx as usize];
+                total_r_sq += (residual[j] * residual[j]) as f64;
             }
 
             // Per-point ||r||
@@ -228,15 +219,25 @@ impl QuantizedData {
             // Pack: (MSE index << 1) | qjl_sign
             match bits {
                 QuantBits::Four => {
+                    // 4 bits per coord: (3-bit idx << 1 | sign), 2 per byte
                     for j in (0..padded_dims).step_by(2) {
-                        let hi = (mse_indices[j] << 1) | qjl_sign_bits[j];
-                        let lo = (mse_indices[j + 1] << 1) | qjl_sign_bits[j + 1];
+                        let hi = ((mse_indices[j] as u8) << 1) | qjl_sign_bits[j];
+                        let lo = ((mse_indices[j + 1] as u8) << 1) | qjl_sign_bits[j + 1];
                         packed.push((hi << 4) | lo);
                     }
                 }
                 QuantBits::Eight => {
+                    // 8 bits per coord: (7-bit idx << 1 | sign), 1 per byte
                     for j in 0..padded_dims {
-                        packed.push((mse_indices[j] << 1) | qjl_sign_bits[j]);
+                        packed.push(((mse_indices[j] as u8) << 1) | qjl_sign_bits[j]);
+                    }
+                }
+                QuantBits::Twelve => {
+                    // 12 bits per coord stored in u16 (2 bytes): (11-bit idx << 1 | sign)
+                    for j in 0..padded_dims {
+                        let val = (mse_indices[j] << 1) | (qjl_sign_bits[j] as u16);
+                        packed.push((val >> 8) as u8);   // high byte
+                        packed.push((val & 0xFF) as u8);  // low byte
                     }
                 }
             }
@@ -281,6 +282,14 @@ impl QuantizedData {
             QuantBits::Eight => {
                 for j in 0..self.padded_dims {
                     let idx = self.packed[offset + j] >> 1;
+                    vec[j] = self.centroids[idx as usize];
+                }
+            }
+            QuantBits::Twelve => {
+                for j in 0..self.padded_dims {
+                    let hi = self.packed[offset + j * 2] as u16;
+                    let lo = self.packed[offset + j * 2 + 1] as u16;
+                    let idx = ((hi << 8) | lo) >> 1;
                     vec[j] = self.centroids[idx as usize];
                 }
             }
@@ -353,10 +362,23 @@ impl QuantizedData {
                 for k in 0..bpp {
                     let bi = self.packed[off_i + k];
                     let bj = self.packed[off_j + k];
-                    let idx_i = bi >> 1;
-                    let idx_j = bj >> 1;
-                    dot += self.centroids[idx_i as usize] * self.centroids[idx_j as usize];
+                    dot += self.centroids[(bi >> 1) as usize] * self.centroids[(bj >> 1) as usize];
                     disagree += ((bi ^ bj) & 1) as u32;
+                }
+                (dot, disagree)
+            }
+            QuantBits::Twelve => {
+                let bpp = self.padded_dims * 2;
+                let off_i = i * bpp;
+                let off_j = j * bpp;
+                let mut dot = 0.0f32;
+                let mut disagree = 0u32;
+                for k in 0..self.padded_dims {
+                    let k2 = k * 2;
+                    let vi = ((self.packed[off_i + k2] as u16) << 8) | (self.packed[off_i + k2 + 1] as u16);
+                    let vj = ((self.packed[off_j + k2] as u16) << 8) | (self.packed[off_j + k2 + 1] as u16);
+                    dot += self.centroids[(vi >> 1) as usize] * self.centroids[(vj >> 1) as usize];
+                    disagree += ((vi ^ vj) & 1) as u32;
                 }
                 (dot, disagree)
             }
@@ -398,6 +420,7 @@ impl QuantizedData {
         match self.bits {
             QuantBits::Four => self.padded_dims / 2,
             QuantBits::Eight => self.padded_dims,
+            QuantBits::Twelve => self.padded_dims * 2,
         }
     }
 
