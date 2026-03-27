@@ -46,6 +46,8 @@ pub enum KnnMethod {
     TurboQuant8Hnsw,
     /// GPU brute-force via cuBLAS (requires 'cuda' feature)
     Gpu,
+    /// GPU TQ4: packed 4-bit dot products via custom PTX kernel (16x less GPU memory)
+    GpuTQ4,
 }
 
 /// Model export format
@@ -161,6 +163,7 @@ impl UMAP {
             KnnMethod::TurboQuant4Hnsw => compute_knn_quant_hnsw(data, k),
             KnnMethod::TurboQuant8Hnsw => compute_knn_quant_hnsw_8bit(data, k),
             KnnMethod::Gpu => gpu::compute_knn_gpu(data, k),
+            KnnMethod::GpuTQ4 => gpu::compute_knn_gpu_tq4(data, k),
         }
     }
 

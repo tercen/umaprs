@@ -313,6 +313,19 @@ impl QuantizedData {
         }
     }
 
+    /// Access raw packed bytes (for GPU upload)
+    pub fn packed_data(&self) -> &[u8] { &self.packed }
+
+    /// Access norms
+    pub fn norms(&self) -> &[f32] { &self.norms }
+
+    /// Get padded dimensionality
+    pub fn padded_dims(&self) -> usize { self.padded_dims }
+
+    /// Get sorted codebook centroids (for GPU upload)
+    pub fn sorted_centroids(&self) -> Vec<f32> {
+        self.centroids_4bit.to_vec()
+    }
 }
 
 
