@@ -1,0 +1,14 @@
+/target
+/.cargo
+/.idea
+
+# Large data files (download separately)
+data/*.fcs
+data/cyto_*.csv
+data/digits_*.csv
+data/pendigits_*.csv
+data/highd_*.csv
+data/bench_*.csv
+
+# Results are regenerated
+results/

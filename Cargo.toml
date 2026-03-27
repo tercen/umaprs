@@ -1,0 +1,11 @@
+[package]
+name = "umaprs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ndarray = "0.15"
+ndarray-rand = "0.14"
+rand = "0.8"
+rayon = "1.10"
+ndarray-linalg = { version = "0.16", features = ["openblas-static"] }
