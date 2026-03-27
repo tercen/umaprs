@@ -280,6 +280,8 @@ mod inner {
         let dev = &kern.dev;
 
         let d_all_packed = dev.htod_sync_copy(packed).expect("Upload packed");
+        let codebook = qdata.sorted_centroids(); // 128 centroids + mse at [128]
+        let d_codebook = dev.htod_sync_copy(&codebook).expect("Upload codebook");
         let d_norms = dev.htod_sync_copy(norms).expect("Upload norms");
 
         let tile_bytes: usize = 512 * 1024 * 1024;
@@ -288,8 +290,6 @@ mod inner {
 
         let inv_d = 1.0f32 / padded_dims as f32;
         let refine_k = k * 2;
-        let quant_range = 3.5f32;
-        let mse_per_coord = qdata.mse_per_coord();
         let mut knn_indices = Array2::zeros((n, k));
         let mut row_start = 0;
 
@@ -301,7 +301,7 @@ mod inner {
             let d_tile = dev.htod_sync_copy(tile_packed).expect("Upload tile");
             let mut d_dots = dev.alloc_zeros::<f32>(tile_rows * n).expect("Alloc dots");
 
-            // TQ8 dot kernel
+            // TQ8 dot kernel (codebook lookup, same pattern as TQ4)
             let dot_cfg = LaunchConfig {
                 grid_dim: (((n as u32) + 15) / 16, ((tile_rows as u32) + 15) / 16, 1),
                 block_dim: (16, 16, 1),
@@ -310,13 +310,13 @@ mod inner {
             let ptr_a = *d_tile.device_ptr();
             let ptr_b = *d_all_packed.device_ptr();
             let mut ptr_c = *d_dots.device_ptr_mut();
+            let ptr_cb = *d_codebook.device_ptr();
             let (arg_tr, arg_n, arg_d) = (tile_rows as i32, n as i32, padded_dims as i32);
             let mut dot_args: Vec<*mut std::ffi::c_void> = vec![
                 &ptr_a as *const _ as *mut _, &ptr_b as *const _ as *mut _,
-                &mut ptr_c as *mut _ as *mut _,
+                &mut ptr_c as *mut _ as *mut _, &ptr_cb as *const _ as *mut _,
                 &arg_tr as *const _ as *mut _, &arg_n as *const _ as *mut _,
                 &arg_d as *const _ as *mut _,
-                &quant_range as *const _ as *mut _, &mse_per_coord as *const _ as *mut _,
             ];
             unsafe { kern.tq8_dot.clone().launch(dot_cfg, &mut dot_args).expect("tq8_dot failed"); }
 

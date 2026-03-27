@@ -59,14 +59,14 @@ extern "C" __global__ void tq4_dot(
 }
 
 // Kernel 1b: TQ8 packed 8-bit dot products (7-bit MSE + 1-bit QJL sign)
-// Each byte: (7-bit uniform index << 1) | sign_bit
+// Each byte: (7-bit index << 1) | sign_bit
+// Uses codebook lookup (same as TQ4 but with 128-level codebook)
 extern "C" __global__ void tq8_dot(
     const unsigned char* __restrict__ A,  // tile: tile_rows × d bytes
     const unsigned char* __restrict__ B,  // data: n × d bytes
     float* __restrict__ C,                // output: tile_rows × n
-    int tile_rows, int n, int d,
-    float quant_range,   // quantizer range (3.5)
-    float mse_per_coord  // for QJL correction
+    const float* __restrict__ codebook,   // 128 centroids + mse_per_coord at [128]
+    int tile_rows, int n, int d
 ) {
     int i = blockIdx.y * blockDim.y + threadIdx.y;
     int j = blockIdx.x * blockDim.x + threadIdx.x;
@@ -77,20 +77,19 @@ extern "C" __global__ void tq8_dot(
     int sign_disagree = 0;
     const unsigned char* row_a = A + i * d;
     const unsigned char* row_b = B + j * d;
-    float scale = 2.0f * quant_range / 127.0f;
 
     for (int k = 0; k < d; k++) {
         unsigned char a = row_a[k];
         unsigned char b = row_b[k];
         // byte = (7-bit idx << 1) | sign
-        float va = (float)(a >> 1) * scale - quant_range;
-        float vb = (float)(b >> 1) * scale - quant_range;
+        float va = codebook[a >> 1];
+        float vb = codebook[b >> 1];
         dot += va * vb;
         sign_disagree += (a ^ b) & 1;
     }
 
-    // QJL correction: (π/2)/d · mse · (d - 2·disagree)
     float fd = (float)d;
+    float mse_per_coord = codebook[128];
     float agreement = fd - 2.0f * (float)sign_disagree;
     float qjl = 1.5707964f / fd * mse_per_coord * agreement;
     C[i * n + j] = dot + qjl;
