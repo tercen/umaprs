@@ -10,6 +10,7 @@
 
 use ndarray::Array2;
 use rayon::prelude::*;
+use crate::quadtree::QuadTree;
 
 /// Compute pairwise conditional probabilities from kNN distances.
 /// Uses binary search for per-point sigma to match target perplexity.
@@ -122,7 +123,85 @@ fn compute_knn_dists(
     knn_dists
 }
 
-/// t-SNE gradient descent optimization
+/// t-SNE with Barnes-Hut O(n log n) approximation
+pub fn tsne_optimize_bh(
+    embedding: &mut Array2<f64>,
+    p_rows: &[usize],
+    p_cols: &[usize],
+    p_vals: &[f64],
+    n_iter: usize,
+    learning_rate: f64,
+    early_exaggeration: f64,
+    early_exaggeration_iter: usize,
+    theta: f64,
+) {
+    let n = embedding.nrows();
+    let mut gains = Array2::from_elem((n, 2), 1.0f64);
+    let mut velocity = Array2::zeros((n, 2));
+
+    for iter in 0..n_iter {
+        let momentum = if iter < 250 { 0.5 } else { 0.8 };
+        let exag = if iter < early_exaggeration_iter { early_exaggeration } else { 1.0 };
+
+        // Extract current positions
+        let ex: Vec<f64> = embedding.column(0).to_vec();
+        let ey: Vec<f64> = embedding.column(1).to_vec();
+
+        // Build quadtree and compute repulsive forces O(n log n)
+        let tree = QuadTree::build(&ex, &ey);
+        let (rep_fx, rep_fy, z_sum) = tree.compute_repulsion(&ex, &ey, theta);
+
+        let mut grad = Array2::zeros((n, 2));
+
+        // Attractive forces (sparse, from P matrix)
+        for idx in 0..p_rows.len() {
+            let i = p_rows[idx];
+            let j = p_cols[idx];
+            let p = p_vals[idx] * exag;
+
+            let dx = ex[i] - ex[j];
+            let dy = ey[i] - ey[j];
+            let d2 = dx * dx + dy * dy;
+            let q = 1.0 / (1.0 + d2);
+
+            let mult = 4.0 * p * q;
+            grad[[i, 0]] += mult * dx;
+            grad[[i, 1]] += mult * dy;
+        }
+
+        // Repulsive forces from Barnes-Hut (already computed)
+        let z_inv = 1.0 / z_sum.max(1e-20);
+        for i in 0..n {
+            grad[[i, 0]] -= 4.0 * z_inv * rep_fx[i];
+            grad[[i, 1]] -= 4.0 * z_inv * rep_fy[i];
+        }
+
+        // Update with momentum + adaptive gains
+        for i in 0..n {
+            for c in 0..2usize {
+                let g: f64 = grad[[i, c]];
+                let v: f64 = velocity[[i, c]];
+                if (g > 0.0) != (v > 0.0) {
+                    gains[[i, c]] = (gains[[i, c]] + 0.2).min(10.0);
+                } else {
+                    gains[[i, c]] = (gains[[i, c]] * 0.8).max(0.01);
+                }
+                velocity[[i, c]] = momentum * v - learning_rate * gains[[i, c]] * g;
+                embedding[[i, c]] += velocity[[i, c]];
+            }
+        }
+
+        // Center
+        let mean_x = embedding.column(0).sum() / n as f64;
+        let mean_y = embedding.column(1).sum() / n as f64;
+        for i in 0..n {
+            embedding[[i, 0]] -= mean_x;
+            embedding[[i, 1]] -= mean_y;
+        }
+    }
+}
+
+/// t-SNE exact gradient descent (O(n²) — for reference/small datasets)
 pub fn tsne_optimize(
     embedding: &mut Array2<f64>,
     p_rows: &[usize],
@@ -248,15 +327,16 @@ pub fn run_tsne(
     // Scale down for t-SNE (typical initial scale ~0.01)
     embedding.mapv_inplace(|x| x * 0.01);
 
-    // Optimize
-    eprintln!("  Optimizing ({} iterations)...", n_iter);
-    tsne_optimize(
+    // Optimize with Barnes-Hut
+    eprintln!("  Optimizing ({} iterations, Barnes-Hut theta=0.5)...", n_iter);
+    tsne_optimize_bh(
         &mut embedding,
         &p_rows, &p_cols, &p_vals,
         n_iter,
         learning_rate,
-        12.0,   // early exaggeration factor
-        250,    // early exaggeration iterations
+        12.0,
+        250,
+        0.5,    // Barnes-Hut theta
     );
 
     embedding
@@ -298,15 +378,16 @@ pub fn run_tsne_compressed(
     let mut embedding = crate::compressed::pca_compressed(qdata, 2, random_state);
     embedding.mapv_inplace(|x| x * 0.01);
 
-    // Optimize
-    eprintln!("  Optimizing ({} iterations)...", n_iter);
-    tsne_optimize(
+    // Optimize with Barnes-Hut
+    eprintln!("  Optimizing ({} iterations, Barnes-Hut theta=0.5)...", n_iter);
+    tsne_optimize_bh(
         &mut embedding,
         &p_rows, &p_cols, &p_vals,
         n_iter,
         learning_rate,
         12.0,
         250,
+        0.5,
     );
 
     embedding

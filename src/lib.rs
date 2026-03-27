@@ -9,6 +9,7 @@ mod knn;
 mod fuzzy;
 mod model;
 mod quantize;
+mod quadtree;
 mod sparse;
 mod spectral;
 mod optimize;
