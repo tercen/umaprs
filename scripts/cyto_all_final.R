@@ -23,8 +23,8 @@ timings <- read.csv("results/timings.csv")
 read_if <- function(path) if (file.exists(path)) read.csv(path) else NULL
 embs <- list(
     "kd-tree"     = read_if("results/cyto_emb_kdtree.csv"),
-    "TQ4+kd+QJL"  = read_if("results/cyto_emb_tq4.csv"),
-    "TQ8+kd+QJL"  = read_if("results/cyto_emb_tq8.csv"),
+    "TQ4+QJL"  = read_if("results/cyto_emb_tq4.csv"),
+    "TQ8+QJL"  = read_if("results/cyto_emb_tq8.csv"),
     "train 10%"   = read_if("results/cyto_emb_train10.csv"),
     "GPU f32"      = read_if("results/cyto_emb_gpu.csv"),
     "GPU TQ4"      = read_if("results/cyto_emb_gpu_tq4.csv")

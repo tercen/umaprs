@@ -1,5 +1,5 @@
 use ndarray::Array2;
-use umaprs::{UMAP, KnnMethod, compute_knn_quant4_kdtree, compute_knn_quant8_kdtree};
+use umaprs::{UMAP, KnnMethod, compute_knn_quant4_bruteforce, compute_knn_quant8_bruteforce};
 use std::fs::File;
 use std::io::{Write, BufReader, BufRead};
 use std::time::Instant;
@@ -47,20 +47,20 @@ fn main() {
     run(&data, "kd-tree", "results/cyto_emb_kdtree.csv", &umap, &mut timings);
 
     let t = Instant::now();
-    let knn = compute_knn_quant4_kdtree(&data, 15);
+    let knn = compute_knn_quant4_bruteforce(&data, 15);
     let emb = umap.fit_transform_with_knn(&data, &knn);
     let elapsed = t.elapsed().as_secs_f64();
-    println!("{:<18} {:.3}s", "TQ4+kd+QJL", elapsed);
+    println!("{:<18} {:.3}s", "TQ4+QJL", elapsed);
     save(&emb, "results/cyto_emb_tq4.csv");
-    timings.push(("TQ4+kd+QJL".into(), elapsed));
+    timings.push(("TQ4+QJL".into(), elapsed));
 
     let t = Instant::now();
-    let knn = compute_knn_quant8_kdtree(&data, 15);
+    let knn = compute_knn_quant8_bruteforce(&data, 15);
     let emb = umap.fit_transform_with_knn(&data, &knn);
     let elapsed = t.elapsed().as_secs_f64();
-    println!("{:<18} {:.3}s", "TQ8+kd+QJL", elapsed);
+    println!("{:<18} {:.3}s", "TQ8+QJL", elapsed);
     save(&emb, "results/cyto_emb_tq8.csv");
-    timings.push(("TQ8+kd+QJL".into(), elapsed));
+    timings.push(("TQ8+QJL".into(), elapsed));
 
     run(&data, "train 10%",
         "results/cyto_emb_train10.csv",

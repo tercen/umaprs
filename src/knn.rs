@@ -149,49 +149,46 @@ pub fn compute_knn_kdtree(data: &Array2<f64>, k: usize) -> Array2<usize> {
     knn_indices
 }
 
-/// TurboQuant + kd-tree: quantize, dequantize to f32, exact kNN on quantized repr.
-pub fn compute_knn_quant_kdtree(data: &Array2<f64>, k: usize, bits: QuantBits) -> Array2<usize> {
-    let n_samples = data.nrows();
+/// TurboQuant brute-force: uses approx_dist_sq (MSE + QJL correction) directly.
+/// No dequantization — works on packed data. O(n²) but cache-friendly on compressed data.
+pub fn compute_knn_quant_bruteforce(data: &Array2<f64>, k: usize, bits: QuantBits) -> Array2<usize> {
+    let n = data.nrows();
     let qdata = QuantizedData::encode_with_bits(data, 42, bits);
 
-    let original_bytes = n_samples * data.ncols() * 8;
+    let original_bytes = n * data.ncols() * 8;
     let quant_bytes = qdata.memory_bytes();
     eprintln!(
-        "  TQ {:?} + kd-tree: {} KB -> {} KB ({:.1}x compression)",
+        "  TQ {:?} brute-force: {} KB -> {} KB ({:.1}x compression)",
         bits, original_bytes / 1024, quant_bytes / 1024,
         original_bytes as f64 / quant_bytes as f64
     );
 
-    // Dequantize all vectors to f32 for kd-tree
-    let n_dims = data.ncols();
-    let mut flat = vec![0.0f32; n_samples * n_dims];
-    for i in 0..n_samples {
-        let decoded = qdata.decode(i);
-        for j in 0..n_dims {
-            flat[i * n_dims + j] = decoded[j];
-        }
-    }
+    let refine_k = (k * 2).min(n - 1);
+    let mut knn_indices = Array2::zeros((n, k));
 
-    let tree = KdTree::build(&flat, n_samples, n_dims);
-
-    // kd-tree gives exact kNN on the dequantized data,
-    // then refine with exact f64 distances on original data
-    let refine_k = (k * 2).min(n_samples - 1);
-    let mut knn_indices = Array2::zeros((n_samples, k));
     knn_indices
         .outer_iter_mut()
         .enumerate()
         .par_bridge()
         .for_each(|(i, mut row)| {
-            let candidates = tree.knn(i, refine_k);
-
-            let point = data.row(i);
-            let mut exact_dists: Vec<(usize, f64)> = candidates.iter()
-                .map(|&(nb, _)| (nb as usize, euclidean_distance(point, data.row(nb as usize))))
+            // Phase 1: approximate distances using quantized data (MSE + QJL)
+            let mut dists: Vec<(usize, f32)> = (0..n)
+                .filter(|&j| j != i)
+                .map(|j| (j, qdata.approx_dist_sq(i, j)))
                 .collect();
-            exact_dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
-            for (idx, &(neighbor, _)) in exact_dists.iter().take(k).enumerate() {
+            // Get top 2k candidates
+            dists.select_nth_unstable_by(refine_k, |a, b| a.1.partial_cmp(&b.1).unwrap());
+            dists.truncate(refine_k);
+
+            // Phase 2: refine with exact f64 distances
+            let point = data.row(i);
+            let mut exact: Vec<(usize, f64)> = dists.iter()
+                .map(|&(j, _)| (j, euclidean_distance(point, data.row(j))))
+                .collect();
+            exact.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+            for (idx, &(neighbor, _)) in exact.iter().take(k).enumerate() {
                 row[idx] = neighbor;
             }
         });
@@ -199,14 +196,14 @@ pub fn compute_knn_quant_kdtree(data: &Array2<f64>, k: usize, bits: QuantBits) -
     knn_indices
 }
 
-/// TQ 4-bit + kd-tree
-pub fn compute_knn_quant4_kdtree(data: &Array2<f64>, k: usize) -> Array2<usize> {
-    compute_knn_quant_kdtree(data, k, QuantBits::Four)
+/// TQ 4-bit brute-force (MSE + QJL correction)
+pub fn compute_knn_quant4_bruteforce(data: &Array2<f64>, k: usize) -> Array2<usize> {
+    compute_knn_quant_bruteforce(data, k, QuantBits::Four)
 }
 
-/// TQ 8-bit + kd-tree
-pub fn compute_knn_quant8_kdtree(data: &Array2<f64>, k: usize) -> Array2<usize> {
-    compute_knn_quant_kdtree(data, k, QuantBits::Eight)
+/// TQ 8-bit brute-force (MSE + QJL correction)
+pub fn compute_knn_quant8_bruteforce(data: &Array2<f64>, k: usize) -> Array2<usize> {
+    compute_knn_quant_bruteforce(data, k, QuantBits::Eight)
 }
 
 /// Plain HNSW with f32 distances (no quantization)
