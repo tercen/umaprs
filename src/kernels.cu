@@ -51,7 +51,7 @@ extern "C" __global__ void tq4_dot(
     float padded_d = (float)(d_half * 2);
     float mse_per_coord = cb[8]; // stored in codebook slot 8
     float agreement = padded_d - 2.0f * (float)sign_disagree;
-    float qjl = 1.2533141f * mse_per_coord * agreement; // sqrt(pi/2) * mse * agreement
+    float qjl = 1.5707964f * mse_per_coord * agreement; // pi/2 * mse * agreement
     C[i * n + j] = dot + qjl;
 }
 

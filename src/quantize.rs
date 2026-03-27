@@ -110,7 +110,7 @@ pub enum QuantBits {
 ///   Stage 2: QJL on residual: q = sign(S · r) where S is a separate random sign matrix
 ///
 /// Packing: nibble/byte = (MSE index << 1) | qjl_sign_bit
-/// Inner product: dot ≈ mse_dot + √(π/2)/d · ||r_i|| · ||r_j|| · sign_agreement
+/// Inner product: dot ≈ mse_dot + (π/2)/d · ||r_i|| · ||r_j|| · sign_agreement
 pub struct QuantizedData {
     pub n_samples: usize,
     pub n_dims: usize,
@@ -391,14 +391,18 @@ impl QuantizedData {
             }
         };
 
-        // QJL correction: sqrt(π/2)/d · ||r_i|| · ||r_j|| · sign_agreement
-        // Since ||r_i|| ≈ ||r_j|| ≈ sqrt(d · mse_per_coord) for all points:
-        // ||r_i||·||r_j|| ≈ d · mse_per_coord
+        // QJL correction for inner product of two reconstructions:
+        //   <x̃_qjl_x, x̃_qjl_y> = (√(π/2)/d)² · q_x^T·S·S^T·q_y
+        //                        = (π/2)/d² · d · <q_x, q_y>   (since S·S^T ≈ d·I)
+        //                        = (π/2)/d · sign_agreement
+        // Full: ||r_x||·||r_y|| · (π/2)/d · sign_agreement
+        // With ||r_x||·||r_y|| ≈ d · mse_per_coord:
+        //   = mse_per_coord · (π/2) · sign_agreement
         let d = self.padded_dims as f32;
         let agreement = d - 2.0 * sign_disagree as f32;
-        const SQRT_PI_OVER_2: f32 = 1.2533141;
-        let r_norm_product = d * self.qjl_r_norm_sq_per_coord; // ||r_i||·||r_j|| ≈ d·MSE
-        let qjl = SQRT_PI_OVER_2 / d * r_norm_product * agreement;
+        const PI_OVER_2: f32 = 1.5707964; // (√(π/2))² = π/2
+        let r_norm_product = d * self.qjl_r_norm_sq_per_coord;
+        let qjl = PI_OVER_2 / d * r_norm_product * agreement;
 
         let corrected_dot = mse_dot + qjl;
         let inv_d = 1.0 / d;
