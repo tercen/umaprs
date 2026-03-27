@@ -1,377 +1,282 @@
-/// GPU-accelerated kNN using CUDA + cuBLAS.
-///
-/// ||x_i - x_j||² = ||x_i||² + ||x_j||² - 2 * x_i · x_j
-/// The dot products are computed via cuBLAS GEMM: X · X^T
-/// No custom CUDA kernels needed.
+/// GPU-accelerated kNN via CUDA.
+/// Kernels written in CUDA C, compiled at runtime via NVRTC.
+/// No nvcc needed at build time.
 
 use ndarray::Array2;
 use rayon::prelude::*;
 
-/// Check if CUDA is available at runtime
 pub fn cuda_available() -> bool {
     #[cfg(feature = "cuda")]
-    {
-        cudarc::driver::CudaDevice::new(0).is_ok()
-    }
+    { cudarc::driver::CudaDevice::new(0).is_ok() }
     #[cfg(not(feature = "cuda"))]
-    {
-        false
-    }
+    { false }
 }
 
 #[cfg(feature = "cuda")]
-pub fn compute_knn_gpu(data: &Array2<f64>, k: usize) -> Array2<usize> {
-    compute_knn_gpu_tile(data, k, 512)
-}
+mod inner {
+    use super::*;
+    use cudarc::driver::{CudaDevice, CudaFunction, DevicePtr, DevicePtrMut, LaunchAsync, LaunchConfig};
+    use cudarc::nvrtc::compile_ptx;
+    use std::sync::Arc;
 
-/// GPU kNN with configurable tile size (in MB).
-#[cfg(feature = "cuda")]
-pub fn compute_knn_gpu_tile(data: &Array2<f64>, k: usize, tile_mb: usize) -> Array2<usize> {
-    use cudarc::driver::CudaDevice;
-    use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
-    use cudarc::cublas::sys::cublasOperation_t;
-    use cudarc::driver::DevicePtrMut;
+    const CUDA_SRC: &str = include_str!("kernels.cu");
 
-    let n = data.nrows();
-    let d = data.ncols();
+    struct GpuKernels {
+        dev: Arc<CudaDevice>,
+        tq4_dot: CudaFunction,
+        topk: CudaFunction,
+        f32_dot: CudaFunction,
+    }
 
-    eprintln!("GPU kNN: {} points, {} dims", n, d);
-
-    let dev = CudaDevice::new(0).expect("Failed to open CUDA device");
-    let blas = CudaBlas::new(dev.clone()).expect("Failed to create cuBLAS handle");
-
-    // Convert to f32
-    let data_f32: Vec<f32> = data.iter().map(|&v| v as f32).collect();
-
-    // Norms: ||x_i||²
-    let norms: Vec<f32> = (0..n)
-        .map(|i| data_f32[i * d..(i + 1) * d].iter().map(|&v| v * v).sum())
-        .collect();
-
-    // Tile size based on GPU memory (~3 GB for GTX 1650, conservative)
-    // Tile needs: tile_rows * n * 4 bytes for output
-    let max_tile_bytes: usize = tile_mb * 1024 * 1024;
-    let tile_size = (max_tile_bytes / (n * 4)).max(1).min(n);
-
-    eprintln!("  Tile size: {} (of {} total), {} tiles", tile_size, n, (n + tile_size - 1) / tile_size);
-
-    // Upload full data as column-major: X^T is (d × n)
-    // cuBLAS is column-major, so store X as (n × d) col-major = d rows of n elements
-    let mut x_col: Vec<f32> = vec![0.0; n * d];
-    for i in 0..n {
-        for j in 0..d {
-            x_col[j * n + i] = data_f32[i * d + j];
+    fn load_kernels() -> GpuKernels {
+        let dev = CudaDevice::new(0).expect("CUDA device");
+        let ptx = compile_ptx(CUDA_SRC).expect("NVRTC compilation failed");
+        dev.load_ptx(ptx, "umaprs", &["tq4_dot", "topk", "f32_dot"])
+            .expect("Load kernels");
+        GpuKernels {
+            tq4_dot: dev.get_func("umaprs", "tq4_dot").unwrap(),
+            topk: dev.get_func("umaprs", "topk").unwrap(),
+            f32_dot: dev.get_func("umaprs", "f32_dot").unwrap(),
+            dev,
         }
     }
-    let d_x = dev.htod_sync_copy(&x_col).expect("Upload data");
 
-    let mut knn_indices = Array2::zeros((n, k));
+    /// GPU brute-force kNN on f32 data using CUDA dot product + topk kernels.
+    /// No cuBLAS dependency.
+    pub fn compute_knn_gpu(data: &Array2<f64>, k: usize) -> Array2<usize> {
+        let n = data.nrows();
+        let d = data.ncols();
+        eprintln!("GPU kNN: {} points, {} dims", n, d);
 
-    let mut row_start = 0;
-    while row_start < n {
-        let row_end = (row_start + tile_size).min(n);
-        let tile_rows = row_end - row_start;
+        let kern = load_kernels();
+        let dev = &kern.dev;
 
-        // Build tile: columns row_start..row_end of X (col-major: d × tile_rows)
-        let mut tile_col: Vec<f32> = vec![0.0; tile_rows * d];
-        for i in 0..tile_rows {
-            for j in 0..d {
-                tile_col[j * tile_rows + i] = data_f32[(row_start + i) * d + j];
-            }
-        }
-        let d_tile = dev.htod_sync_copy(&tile_col).expect("Upload tile");
-
-        // Output: C (n × tile_rows) col-major = dot products
-        // C[j, ti] = x_j · x_{row_start + ti}
-        let mut d_c = dev.alloc_zeros::<f32>(n * tile_rows).expect("Alloc output");
-
-        // GEMM: C = X^T · X_tile
-        // X^T is (n × d) col-major, X_tile is (d × tile_rows) col-major
-        // C = alpha * X^T * X_tile + beta * C
-        // m=n, n=tile_rows, k=d
-        let cfg = GemmConfig {
-            transa: cublasOperation_t::CUBLAS_OP_T,  // transpose X (stored as d×n) → n×d
-            transb: cublasOperation_t::CUBLAS_OP_N,
-            m: n as i32,
-            n: tile_rows as i32,
-            k: d as i32,
-            alpha: 1.0f32,
-            lda: d as i32,   // leading dim of X col-major (d × n), but transposed → d
-            ldb: d as i32,   // leading dim of tile (d × tile_rows)
-            beta: 0.0f32,
-            ldc: n as i32,   // leading dim of C (n × tile_rows)
-        };
-
-        // Hmm, the layout is tricky. Let me use a simpler approach:
-        // Store X as row-major (n × d), use OP_T to treat it as (d × n)^T = (n × d)
-        // Actually: cuBLAS col-major with OP_N on (n×d) stored col-major = (n×d) matrix
-        // Let me just store everything in col-major properly.
-
-        // X_cm: column-major (n × d) = d columns of n elements
-        // Already stored in x_col as exactly this.
-        // GEMM: C = X_cm * X_tile_cm^T? No...
-        //
-        // We want: C[i,j] = sum_k X[i,k] * X[row_start+j,k] = dot(row_i, row_j)
-        // In col-major, X is (n × d), so:
-        // C = X * X_tile^T, where X_tile is (tile_rows × d)
-        // GEMM: transa=N, transb=T, m=n, n=tile_rows, k=d
-        // A = X (n×d, col-major, lda=n)
-        // B = X_tile (tile_rows × d, col-major, ldb=tile_rows)
-        // C = (n × tile_rows, col-major, ldc=n)
-
-        // Re-store tile as (tile_rows × d) col-major
-        let mut tile_cm: Vec<f32> = vec![0.0; tile_rows * d];
-        for i in 0..tile_rows {
-            for j in 0..d {
-                tile_cm[j * tile_rows + i] = data_f32[(row_start + i) * d + j];
-            }
-        }
-        let d_tile2 = dev.htod_sync_copy(&tile_cm).expect("Upload tile2");
-
-        let cfg2 = GemmConfig {
-            transa: cublasOperation_t::CUBLAS_OP_N,
-            transb: cublasOperation_t::CUBLAS_OP_T,
-            m: n as i32,
-            n: tile_rows as i32,
-            k: d as i32,
-            alpha: 1.0f32,
-            lda: n as i32,
-            ldb: tile_rows as i32,
-            beta: 0.0f32,
-            ldc: n as i32,
-        };
-
-        unsafe {
-            <CudaBlas as Gemm<f32>>::gemm(&blas, cfg2, &d_x, &d_tile2, &mut d_c)
-                .expect("cuBLAS GEMM failed");
-        }
-
-        // Download dot products
-        let t_dl = std::time::Instant::now();
-        let dots = dev.dtoh_sync_copy(&d_c).expect("Download dots");
-        let dl_ms = t_dl.elapsed().as_millis();
-
-        let t_topk = std::time::Instant::now();
-
-        // Find top-k per tile row using distances
-        let tile_results: Vec<Vec<usize>> = (0..tile_rows)
-            .into_par_iter()
-            .map(|ti| {
-                let i = row_start + ti;
-                let ni = norms[i];
-
-                let mut dists: Vec<(u32, f32)> = (0..n as u32)
-                    .filter(|&j| j as usize != i)
-                    .map(|j| {
-                        let dot = dots[j as usize + ti * n];
-                        let dist_sq = (ni + norms[j as usize] - 2.0 * dot).max(0.0);
-                        (j, dist_sq)
-                    })
-                    .collect();
-
-                dists.select_nth_unstable_by(k, |a, b| a.1.partial_cmp(&b.1).unwrap());
-                dists.truncate(k);
-                dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-
-                dists.iter().take(k).map(|&(nb, _)| nb as usize).collect()
-            })
+        let data_f32: Vec<f32> = data.iter().map(|&v| v as f32).collect();
+        let norms: Vec<f32> = (0..n)
+            .map(|i| data_f32[i * d..(i + 1) * d].iter().map(|v| v * v).sum())
             .collect();
 
-        if row_start == 0 {
-            eprintln!("  First tile: download {}ms, top-k {}ms", dl_ms, t_topk.elapsed().as_millis());
-        }
+        // Upload all data (row-major f32)
+        let d_data = dev.htod_sync_copy(&data_f32).expect("Upload data");
+        let d_norms = dev.htod_sync_copy(&norms).expect("Upload norms");
 
-        for (ti, neighbors) in tile_results.iter().enumerate() {
-            let i = row_start + ti;
-            for (idx, &nb) in neighbors.iter().enumerate() {
-                knn_indices[[i, idx]] = nb;
+        let tile_bytes: usize = 512 * 1024 * 1024;
+        let tile_size = (tile_bytes / (n * 4)).max(1).min(n);
+        eprintln!("  Tile: {} rows, {} tiles", tile_size, (n + tile_size - 1) / tile_size);
+
+        let mut knn_indices = Array2::zeros((n, k));
+        let mut row_start = 0;
+
+        while row_start < n {
+            let row_end = (row_start + tile_size).min(n);
+            let tile_rows = row_end - row_start;
+
+            // Upload tile
+            let tile_data = &data_f32[row_start * d..row_end * d];
+            let d_tile = dev.htod_sync_copy(tile_data).expect("Upload tile");
+            let mut d_dots = dev.alloc_zeros::<f32>(tile_rows * n).expect("Alloc dots");
+
+            // Kernel 1: dot products
+            let dot_cfg = LaunchConfig {
+                grid_dim: (((n as u32) + 15) / 16, ((tile_rows as u32) + 15) / 16, 1),
+                block_dim: (16, 16, 1),
+                shared_mem_bytes: 0,
+            };
+            let (ptr_t, ptr_d, mut ptr_o) = (*d_tile.device_ptr(), *d_data.device_ptr(), *d_dots.device_ptr_mut());
+            let (arg_tr, arg_n, arg_d) = (tile_rows as i32, n as i32, d as i32);
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                &ptr_t as *const _ as *mut _, &ptr_d as *const _ as *mut _,
+                &mut ptr_o as *mut _ as *mut _,
+                &arg_tr as *const _ as *mut _, &arg_n as *const _ as *mut _, &arg_d as *const _ as *mut _,
+            ];
+            unsafe { kern.f32_dot.clone().launch(dot_cfg, &mut args).expect("f32_dot failed"); }
+
+            // Kernel 2: topk on GPU
+            let tile_norms = &norms[row_start..row_end];
+            let d_tile_norms = dev.htod_sync_copy(tile_norms).expect("Upload tile norms");
+            let mut d_topk = dev.alloc_zeros::<u32>(tile_rows * k).expect("Alloc topk");
+
+            let topk_cfg = LaunchConfig {
+                grid_dim: (tile_rows as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let ptr_dots = *d_dots.device_ptr();
+            let ptr_tn = *d_tile_norms.device_ptr();
+            let ptr_an = *d_norms.device_ptr();
+            let mut ptr_tk = *d_topk.device_ptr_mut();
+            let (arg_k, arg_off) = (k as i32, row_start as i32);
+            let inv_d = 1.0f32; // not TQ, so inv_d=1 (dots are already real dot products)
+            // For f32 path: dist = ni + nj - 2*dot (no inv_d scaling)
+            // But our topk kernel uses inv_d for TQ. With inv_d=1 and norms=squared norms, it works.
+
+            let mut topk_args: Vec<*mut std::ffi::c_void> = vec![
+                &ptr_dots as *const _ as *mut _, &ptr_tn as *const _ as *mut _,
+                &ptr_an as *const _ as *mut _, &mut ptr_tk as *mut _ as *mut _,
+                &arg_tr as *const _ as *mut _, &arg_n as *const _ as *mut _,
+                &arg_k as *const _ as *mut _, &arg_off as *const _ as *mut _,
+                &inv_d as *const _ as *mut _,
+            ];
+            unsafe { kern.topk.clone().launch(topk_cfg, &mut topk_args).expect("topk failed"); }
+
+            // Download only k indices per row (tiny)
+            let topk_idx: Vec<u32> = dev.dtoh_sync_copy(&d_topk).expect("Download topk");
+
+            for ti in 0..tile_rows {
+                let i = row_start + ti;
+                for idx in 0..k {
+                    knn_indices[[i, idx]] = topk_idx[ti * k + idx] as usize;
+                }
             }
+
+            row_start = row_end;
         }
 
-        row_start = row_end;
+        knn_indices
     }
 
-    knn_indices
-}
+    /// GPU TQ4: packed 4-bit dot products + topk, all on GPU
+    pub fn compute_knn_gpu_tq4(data: &Array2<f64>, k: usize) -> Array2<usize> {
+        use crate::quantize::{QuantizedData, QuantBits};
 
-/// GPU TQ4: packed 4-bit dot products via custom PTX kernel.
-/// Data stays in 4-bit on GPU (16x less memory than f32).
-/// Kernel computes dot products directly on packed representation.
-#[cfg(feature = "cuda")]
-pub fn compute_knn_gpu_tq4(data: &Array2<f64>, k: usize) -> Array2<usize> {
-    use cudarc::driver::{CudaDevice, DevicePtr, DevicePtrMut};
-    use crate::quantize::{QuantizedData, QuantBits};
+        let n = data.nrows();
+        let d = data.ncols();
+        eprintln!("GPU TQ4 kNN: {} points, {} dims", n, d);
 
-    let n = data.nrows();
-    let d = data.ncols();
-    let d_half = (d.next_power_of_two()) / 2; // padded dims / 2
+        let qdata = QuantizedData::encode_with_bits(data, 42, QuantBits::Four);
+        let packed = qdata.packed_data();
+        let norms = qdata.norms();
+        let codebook = qdata.sorted_centroids();
+        let padded_dims = qdata.padded_dims();
+        let bpp = padded_dims / 2;
 
-    eprintln!("GPU TQ4 kNN: {} points, {} dims (packed: {} bytes/point)", n, d, d_half);
+        eprintln!("  Memory: {} KB -> {} KB ({:.1}x)",
+                  n * d * 8 / 1024, qdata.memory_bytes() / 1024,
+                  (n * d * 8) as f64 / qdata.memory_bytes() as f64);
+        eprintln!("  GPU data: {} KB (vs {} KB f32)", packed.len() / 1024, n * d * 4 / 1024);
 
-    // Quantize
-    let qdata = QuantizedData::encode_with_bits(data, 42, QuantBits::Four);
+        let kern = load_kernels();
+        let dev = &kern.dev;
 
-    let original_bytes = n * d * 8;
-    let quant_bytes = qdata.memory_bytes();
-    eprintln!("  Memory: {} KB -> {} KB ({:.1}x compression)",
-              original_bytes / 1024, quant_bytes / 1024,
-              original_bytes as f64 / quant_bytes as f64);
+        let d_all_packed = dev.htod_sync_copy(packed).expect("Upload packed");
+        let d_codebook = dev.htod_sync_copy(&codebook).expect("Upload codebook");
+        let d_norms = dev.htod_sync_copy(norms).expect("Upload norms");
 
-    // Get packed bytes and norms
-    let packed = qdata.packed_data();
-    let norms = qdata.norms();
-    let codebook = qdata.sorted_centroids();
-    let padded_dims = qdata.padded_dims();
-    let bytes_per_point = padded_dims / 2;
+        let tile_bytes: usize = 512 * 1024 * 1024;
+        let tile_size = (tile_bytes / (n * 4)).max(1).min(n);
+        eprintln!("  Tile: {} rows, {} tiles", tile_size, (n + tile_size - 1) / tile_size);
 
-    let dev = CudaDevice::new(0).expect("CUDA device");
-
-    // Load PTX kernel
-    let ptx = include_str!("tq4_dot.ptx");
-    dev.load_ptx(ptx.into(), "tq4mod", &["tq4_dot"]).expect("Load PTX");
-    let func = dev.get_func("tq4mod", "tq4_dot").expect("Get kernel");
-
-    // Upload all packed data to GPU (tiny: n * bytes_per_point)
-    let d_B = dev.htod_sync_copy(packed).expect("Upload packed data");
-    let d_codebook = dev.htod_sync_copy(&codebook).expect("Upload codebook");
-
-    let gpu_data_bytes = packed.len();
-    eprintln!("  GPU data: {} KB (vs {} KB for f32)",
-              gpu_data_bytes / 1024, (n * d * 4) / 1024);
-
-    // Tile and compute
-    let max_tile_bytes: usize = 512 * 1024 * 1024; // 512 MB for output tile
-    let tile_size = (max_tile_bytes / (n * 4)).max(1).min(n);
-    let n_tiles = (n + tile_size - 1) / tile_size;
-    eprintln!("  Tile: {} rows, {} tiles", tile_size, n_tiles);
-
-    let mut knn_indices = Array2::zeros((n, k));
-
-    let mut row_start = 0;
-    while row_start < n {
-        let row_end = (row_start + tile_size).min(n);
-        let tile_rows = row_end - row_start;
-
-        // Upload tile packed data
-        let tile_packed = &packed[row_start * bytes_per_point..row_end * bytes_per_point];
-        let d_A = dev.htod_sync_copy(tile_packed).expect("Upload tile");
-
-        // Allocate output
-        let mut d_C = dev.alloc_zeros::<f32>(tile_rows * n).expect("Alloc output");
-
-        // Launch kernel
-        let block_dim = (16u32, 16u32, 1u32);
-        let grid_dim = (
-            ((n as u32) + block_dim.0 - 1) / block_dim.0,
-            ((tile_rows as u32) + block_dim.1 - 1) / block_dim.1,
-            1u32,
-        );
-
-        let cfg = cudarc::driver::LaunchConfig {
-            grid_dim,
-            block_dim,
-            shared_mem_bytes: 0,
-        };
-
-        // Build kernel args as raw pointers
-        let ptr_a = *d_A.device_ptr();
-        let ptr_b = *d_B.device_ptr();
-        let mut ptr_c = *d_C.device_ptr_mut();
-        let ptr_cb = *d_codebook.device_ptr();
-        let arg_tr = tile_rows as u32;
-        let arg_n = n as u32;
-        let arg_dh = bytes_per_point as u32;
-
-        let mut args: Vec<*mut std::ffi::c_void> = vec![
-            &ptr_a as *const _ as *mut _,
-            &ptr_b as *const _ as *mut _,
-            &mut ptr_c as *mut _ as *mut _,
-            &ptr_cb as *const _ as *mut _,
-            &arg_tr as *const _ as *mut _,
-            &arg_n as *const _ as *mut _,
-            &arg_dh as *const _ as *mut _,
-        ];
-
-        unsafe {
-            use cudarc::driver::LaunchAsync;
-            func.clone().launch(cfg, &mut args).expect("Kernel launch failed");
-        }
-
-        // Download dot products
-        let dots = dev.dtoh_sync_copy(&d_C).expect("Download");
-
-        // Compute distances and find top-k
-        // ||x-y||² = n_i² + n_j² - 2*dot (in quantized/rotated space, scaled by 1/padded_dims)
         let inv_d = 1.0f32 / padded_dims as f32;
-        let tile_results: Vec<Vec<usize>> = (0..tile_rows)
-            .into_par_iter()
-            .map(|ti| {
-                let i = row_start + ti;
-                let ni = norms[i];
+        let refine_k = k * 2; // get 2k from GPU, refine on CPU
+        let mut knn_indices = Array2::zeros((n, k));
+        let mut row_start = 0;
 
-                let mut dists: Vec<(u32, f32)> = (0..n as u32)
-                    .filter(|&j| j as usize != i)
-                    .map(|j| {
-                        let dot = dots[j as usize + ti * n];
-                        let cos = (dot * inv_d).clamp(-1.0, 1.0);
-                        let dist_sq = ni * ni + norms[j as usize] * norms[j as usize] - 2.0 * ni * norms[j as usize] * cos;
-                        (j, dist_sq.max(0.0))
-                    })
-                    .collect();
+        while row_start < n {
+            let row_end = (row_start + tile_size).min(n);
+            let tile_rows = row_end - row_start;
 
-                // Get top 2k, then refine with exact distances
-                let refine_k = (k * 2).min(dists.len());
-                dists.select_nth_unstable_by(refine_k, |a, b| a.1.partial_cmp(&b.1).unwrap());
-                dists.truncate(refine_k);
+            let tile_packed = &packed[row_start * bpp..row_end * bpp];
+            let d_tile = dev.htod_sync_copy(tile_packed).expect("Upload tile");
+            let mut d_dots = dev.alloc_zeros::<f32>(tile_rows * n).expect("Alloc dots");
 
-                // Refine with exact f64 distances
-                let point = data.row(i);
-                let mut exact: Vec<(usize, f64)> = dists.iter()
-                    .map(|&(j, _)| {
-                        let d: f64 = point.iter().zip(data.row(j as usize).iter())
-                            .map(|(&a, &b)| (a - b).powi(2)).sum();
-                        (j as usize, d)
-                    })
-                    .collect();
-                exact.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-                exact.iter().take(k).map(|&(nb, _)| nb).collect()
-            })
-            .collect();
+            // Kernel 1: TQ4 dot products
+            let dot_cfg = LaunchConfig {
+                grid_dim: (((n as u32) + 15) / 16, ((tile_rows as u32) + 15) / 16, 1),
+                block_dim: (16, 16, 1),
+                shared_mem_bytes: 0,
+            };
+            let ptr_a = *d_tile.device_ptr();
+            let ptr_b = *d_all_packed.device_ptr();
+            let mut ptr_c = *d_dots.device_ptr_mut();
+            let ptr_cb = *d_codebook.device_ptr();
+            let (arg_tr, arg_n, arg_dh) = (tile_rows as i32, n as i32, bpp as i32);
+            let mut dot_args: Vec<*mut std::ffi::c_void> = vec![
+                &ptr_a as *const _ as *mut _, &ptr_b as *const _ as *mut _,
+                &mut ptr_c as *mut _ as *mut _, &ptr_cb as *const _ as *mut _,
+                &arg_tr as *const _ as *mut _, &arg_n as *const _ as *mut _, &arg_dh as *const _ as *mut _,
+            ];
+            unsafe { kern.tq4_dot.clone().launch(dot_cfg, &mut dot_args).expect("tq4_dot failed"); }
 
-        for (ti, neighbors) in tile_results.iter().enumerate() {
-            let i = row_start + ti;
-            for (idx, &nb) in neighbors.iter().enumerate() {
-                knn_indices[[i, idx]] = nb;
+            // Kernel 2: topk on GPU
+            let tile_norms: Vec<f32> = norms[row_start..row_end].to_vec();
+            let d_tile_norms = dev.htod_sync_copy(&tile_norms).expect("Upload tile norms");
+            let mut d_topk = dev.alloc_zeros::<u32>(tile_rows * refine_k).expect("Alloc topk");
+
+            let topk_cfg = LaunchConfig {
+                grid_dim: (tile_rows as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let ptr_dots = *d_dots.device_ptr();
+            let ptr_tn = *d_tile_norms.device_ptr();
+            let ptr_an = *d_norms.device_ptr();
+            let mut ptr_tk = *d_topk.device_ptr_mut();
+            let (arg_rk, arg_off) = (refine_k as i32, row_start as i32);
+            let mut topk_args: Vec<*mut std::ffi::c_void> = vec![
+                &ptr_dots as *const _ as *mut _, &ptr_tn as *const _ as *mut _,
+                &ptr_an as *const _ as *mut _, &mut ptr_tk as *mut _ as *mut _,
+                &arg_tr as *const _ as *mut _, &arg_n as *const _ as *mut _,
+                &arg_rk as *const _ as *mut _, &arg_off as *const _ as *mut _,
+                &inv_d as *const _ as *mut _,
+            ];
+            unsafe { kern.topk.clone().launch(topk_cfg, &mut topk_args).expect("topk failed"); }
+
+            // Download tiny topk indices, refine on CPU
+            let topk_idx: Vec<u32> = dev.dtoh_sync_copy(&d_topk).expect("Download topk");
+
+            let tile_results: Vec<Vec<usize>> = (0..tile_rows)
+                .into_par_iter()
+                .map(|ti| {
+                    let i = row_start + ti;
+                    let candidates: Vec<usize> = (0..refine_k)
+                        .map(|r| topk_idx[ti * refine_k + r] as usize)
+                        .filter(|&j| j != i && j < n)
+                        .collect();
+                    let point = data.row(i);
+                    let mut exact: Vec<(usize, f64)> = candidates.iter()
+                        .map(|&j| {
+                            let d: f64 = point.iter().zip(data.row(j).iter())
+                                .map(|(&a, &b)| (a - b).powi(2)).sum();
+                            (j, d)
+                        })
+                        .collect();
+                    exact.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                    exact.iter().take(k).map(|&(nb, _)| nb).collect()
+                })
+                .collect();
+
+            for (ti, neighbors) in tile_results.iter().enumerate() {
+                for (idx, &nb) in neighbors.iter().enumerate() {
+                    knn_indices[[row_start + ti, idx]] = nb;
+                }
             }
+
+            row_start = row_end;
         }
 
-        row_start = row_end;
+        knn_indices
     }
-
-    knn_indices
 }
 
-#[cfg(not(feature = "cuda"))]
-pub fn compute_knn_gpu_tq4(_data: &Array2<f64>, _k: usize) -> Array2<usize> {
-    panic!("GPU TQ4 kNN requires the 'cuda' feature")
-}
+#[cfg(feature = "cuda")]
+pub use inner::{compute_knn_gpu, compute_knn_gpu_tq4};
 
 #[cfg(not(feature = "cuda"))]
 pub fn compute_knn_gpu(_data: &Array2<f64>, _k: usize) -> Array2<usize> {
     panic!("GPU kNN requires the 'cuda' feature: cargo build --features cuda")
 }
-
+#[cfg(not(feature = "cuda"))]
+pub fn compute_knn_gpu_tq4(_data: &Array2<f64>, _k: usize) -> Array2<usize> {
+    panic!("GPU TQ4 requires the 'cuda' feature: cargo build --features cuda")
+}
 #[cfg(not(feature = "cuda"))]
 pub fn compute_knn_gpu_tile(_data: &Array2<f64>, _k: usize, _tile_mb: usize) -> Array2<usize> {
-    panic!("GPU kNN requires the 'cuda' feature: cargo build --features cuda")
+    panic!("GPU kNN requires the 'cuda' feature")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn test_cuda_available_check() {
-        let _ = cuda_available();
-    }
+    fn test_cuda_check() { let _ = cuda_available(); }
 }
