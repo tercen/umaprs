@@ -27,13 +27,32 @@ extern "C" __global__ void tq4_dot(
     const unsigned char* row_a = A + i * d_half;
     const unsigned char* row_b = B + j * d_half;
 
+    int sign_disagree = 0;
     for (int k = 0; k < d_half; k++) {
         unsigned char a = row_a[k];
         unsigned char b = row_b[k];
-        dot += cb[a >> 4] * cb[b >> 4] + cb[a & 0xF] * cb[b & 0xF];
+        // Each nibble: (3-bit MSE idx << 1) | 1-bit QJL sign
+        unsigned char a_hi = (a >> 4) & 0x0F;
+        unsigned char b_hi = (b >> 4) & 0x0F;
+        unsigned char a_lo = a & 0x0F;
+        unsigned char b_lo = b & 0x0F;
+        // MSE dot: use top 3 bits as codebook index
+        dot += cb[a_hi >> 1] * cb[b_hi >> 1] + cb[a_lo >> 1] * cb[b_lo >> 1];
+        // QJL sign disagreement: bottom bit of each nibble
+        sign_disagree += ((a_hi ^ b_hi) & 1) + ((a_lo ^ b_lo) & 1);
     }
 
-    C[i * n + j] = dot;
+    // Pack MSE dot + sign_disagree into output
+    // C[i*n + j] stores the QJL-corrected dot product
+    // Correction: sqrt(pi/2)/d * mse_per_coord * d * (d - 2*sign_disagree)
+    //           = sqrt(pi/2) * mse_per_coord * (d - 2*sign_disagree)
+    // where d = d_half * 2 (padded_dims)
+    // mse_per_coord is passed via codebook[8] (slot after the 8 centroids)
+    float padded_d = (float)(d_half * 2);
+    float mse_per_coord = cb[8]; // stored in codebook slot 8
+    float agreement = padded_d - 2.0f * (float)sign_disagree;
+    float qjl = 1.2533141f * mse_per_coord * agreement; // sqrt(pi/2) * mse * agreement
+    C[i * n + j] = dot + qjl;
 }
 
 // Kernel 2: Per-row top-k selection
@@ -45,7 +64,9 @@ extern "C" __global__ void topk(
     unsigned int* __restrict__ out_idx,    // tile_rows × k
     int tile_rows, int n, int k,
     int row_offset,  // for self-skip
-    float inv_d      // 1.0 / padded_dims
+    float inv_d,     // 1.0 / padded_dims for TQ mode, 0.0 for f32 mode
+    int mode         // 0 = f32 (norms are squared, dist = ni+nj-2*dot)
+                     // 1 = TQ  (norms are L2, dist = ni²+nj²-2*ni*nj*clamp(dot*inv_d))
 ) {
     int row = blockIdx.x;
     if (row >= tile_rows) return;
@@ -90,10 +111,17 @@ extern "C" __global__ void topk(
 
             float dot = row_dots[j];
             float nj = norms_all[j];
-            float cos_val = dot * inv_d;
-            if (cos_val > 1.0f) cos_val = 1.0f;
-            if (cos_val < -1.0f) cos_val = -1.0f;
-            float dist = ni * ni + nj * nj - 2.0f * ni * nj * cos_val;
+            float dist;
+            if (mode == 0) {
+                // f32 mode: norms are squared, dots are raw
+                dist = ni + nj - 2.0f * dot;
+            } else {
+                // TQ mode: norms are L2, dots are in rotated/scaled space
+                float cos_val = dot * inv_d;
+                if (cos_val > 1.0f) cos_val = 1.0f;
+                if (cos_val < -1.0f) cos_val = -1.0f;
+                dist = ni * ni + nj * nj - 2.0f * ni * nj * cos_val;
+            }
             if (dist < 0.0f) dist = 0.0f;
 
             if (dist < best_d) {

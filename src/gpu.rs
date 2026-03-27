@@ -106,16 +106,15 @@ mod inner {
             let ptr_an = *d_norms.device_ptr();
             let mut ptr_tk = *d_topk.device_ptr_mut();
             let (arg_k, arg_off) = (k as i32, row_start as i32);
-            let inv_d = 1.0f32; // not TQ, so inv_d=1 (dots are already real dot products)
-            // For f32 path: dist = ni + nj - 2*dot (no inv_d scaling)
-            // But our topk kernel uses inv_d for TQ. With inv_d=1 and norms=squared norms, it works.
+            let inv_d = 0.0f32; // unused in f32 mode
+            let mode = 0i32;    // f32 mode: dist = ni + nj - 2*dot
 
             let mut topk_args: Vec<*mut std::ffi::c_void> = vec![
                 &ptr_dots as *const _ as *mut _, &ptr_tn as *const _ as *mut _,
                 &ptr_an as *const _ as *mut _, &mut ptr_tk as *mut _ as *mut _,
                 &arg_tr as *const _ as *mut _, &arg_n as *const _ as *mut _,
                 &arg_k as *const _ as *mut _, &arg_off as *const _ as *mut _,
-                &inv_d as *const _ as *mut _,
+                &inv_d as *const _ as *mut _, &mode as *const _ as *mut _,
             ];
             unsafe { kern.topk.clone().launch(topk_cfg, &mut topk_args).expect("topk failed"); }
 
@@ -212,12 +211,13 @@ mod inner {
             let ptr_an = *d_norms.device_ptr();
             let mut ptr_tk = *d_topk.device_ptr_mut();
             let (arg_rk, arg_off) = (refine_k as i32, row_start as i32);
+            let mode = 1i32; // TQ mode
             let mut topk_args: Vec<*mut std::ffi::c_void> = vec![
                 &ptr_dots as *const _ as *mut _, &ptr_tn as *const _ as *mut _,
                 &ptr_an as *const _ as *mut _, &mut ptr_tk as *mut _ as *mut _,
                 &arg_tr as *const _ as *mut _, &arg_n as *const _ as *mut _,
                 &arg_rk as *const _ as *mut _, &arg_off as *const _ as *mut _,
-                &inv_d as *const _ as *mut _,
+                &inv_d as *const _ as *mut _, &mode as *const _ as *mut _,
             ];
             unsafe { kern.topk.clone().launch(topk_cfg, &mut topk_args).expect("topk failed"); }
 
