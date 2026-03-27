@@ -2,6 +2,7 @@ use ndarray::Array2;
 
 pub mod gpu;
 mod codebook;
+mod compressed;
 mod hnsw;
 mod kdtree;
 mod knn;
@@ -18,6 +19,7 @@ pub use spectral::{spectral_layout, spectral_layout_with_data};
 pub use optimize::optimize_layout;
 pub use sparse::SparseGraph;
 pub use model::{UmapModel, SamplingStrategy};
+pub use quantize::{QuantBits, QuantizedData};
 
 /// Initialization method for the embedding
 #[derive(Clone, Debug)]
@@ -240,6 +242,56 @@ impl UMAP {
                 self.fit_transform_with_knn(work_data, &knn_indices)
             }
         }
+    }
+
+    /// Run entire UMAP pipeline on TurboQuant-compressed vectors.
+    /// Original data is discarded after compression — only compressed representation used.
+    /// For massive datasets that don't fit in memory as f64.
+    ///
+    /// Memory: n × d × 8 bytes (f64) → n × d/2 bytes (TQ4) or n × d bytes (TQ8)
+    pub fn fit_transform_compressed(&self, data: &Array2<f64>, bits: QuantBits) -> Array2<f64> {
+        let mut reduced = None;
+        let work_data = self.prepare_data(data, &mut reduced);
+        let n = work_data.nrows();
+        let d = work_data.ncols();
+        let n_epochs = self.resolve_n_epochs(n);
+
+        eprintln!("Compressed UMAP: {} points, {} dims, {:?} quantization", n, d, bits);
+
+        // Step 1: Compress — after this, original data not needed
+        let qdata = QuantizedData::encode_with_bits(work_data, self.random_state.unwrap_or(42), bits);
+        let original_mb = (n * d * 8) as f64 / 1024.0 / 1024.0;
+        let compressed_mb = qdata.memory_bytes() as f64 / 1024.0 / 1024.0;
+        eprintln!("  Compressed: {:.1} MB -> {:.1} MB ({:.1}x)", original_mb, compressed_mb,
+                  original_mb / compressed_mb);
+
+        // Step 2: kNN from compressed distances (no exact refinement)
+        eprintln!("  kNN from compressed distances...");
+        let knn_indices = compressed::knn_compressed(&qdata, self.n_neighbors);
+
+        // Step 3: Fuzzy simplicial set from compressed distances
+        eprintln!("  Fuzzy set from compressed distances...");
+        let graph = compressed::fuzzy_compressed(&knn_indices, &qdata, self.n_neighbors);
+        eprintln!("  {} edges", graph.nnz());
+
+        // Step 4: Initialize embedding (PCA on dequantized, streaming)
+        eprintln!("  PCA initialization (streaming dequantize)...");
+        let mut embedding = compressed::pca_compressed(&qdata, self.n_components, self.random_state);
+
+        // Step 5: SGD optimization (only touches 2D embedding, no high-dim data)
+        optimize_layout(
+            &mut embedding,
+            &graph,
+            n_epochs,
+            self.learning_rate,
+            self.min_dist,
+            self.spread,
+            self.negative_sample_rate,
+            self.repulsion_strength,
+            self.random_state,
+        );
+
+        embedding
     }
 
     /// Fit using pre-computed kNN, return embedding only
