@@ -1,6 +1,6 @@
 use ndarray::Array2;
 
-mod gpu;
+pub mod gpu;
 mod hnsw;
 mod kdtree;
 mod knn;

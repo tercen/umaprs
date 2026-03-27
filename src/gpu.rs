@@ -21,6 +21,12 @@ pub fn cuda_available() -> bool {
 
 #[cfg(feature = "cuda")]
 pub fn compute_knn_gpu(data: &Array2<f64>, k: usize) -> Array2<usize> {
+    compute_knn_gpu_tile(data, k, 512)
+}
+
+/// GPU kNN with configurable tile size (in MB).
+#[cfg(feature = "cuda")]
+pub fn compute_knn_gpu_tile(data: &Array2<f64>, k: usize, tile_mb: usize) -> Array2<usize> {
     use cudarc::driver::CudaDevice;
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
     use cudarc::cublas::sys::cublasOperation_t;
@@ -44,10 +50,10 @@ pub fn compute_knn_gpu(data: &Array2<f64>, k: usize) -> Array2<usize> {
 
     // Tile size based on GPU memory (~3 GB for GTX 1650, conservative)
     // Tile needs: tile_rows * n * 4 bytes for output
-    let max_tile_bytes: usize = 256 * 1024 * 1024; // 256 MB for distance tile (safe for 4GB GPUs)
+    let max_tile_bytes: usize = tile_mb * 1024 * 1024;
     let tile_size = (max_tile_bytes / (n * 4)).max(1).min(n);
 
-    eprintln!("  Tile size: {} (of {} total)", tile_size, n);
+    eprintln!("  Tile size: {} (of {} total), {} tiles", tile_size, n, (n + tile_size - 1) / tile_size);
 
     // Upload full data as column-major: X^T is (d × n)
     // cuBLAS is column-major, so store X as (n × d) col-major = d rows of n elements
@@ -141,7 +147,11 @@ pub fn compute_knn_gpu(data: &Array2<f64>, k: usize) -> Array2<usize> {
         }
 
         // Download dot products
+        let t_dl = std::time::Instant::now();
         let dots = dev.dtoh_sync_copy(&d_c).expect("Download dots");
+        let dl_ms = t_dl.elapsed().as_millis();
+
+        let t_topk = std::time::Instant::now();
 
         // Find top-k per tile row using distances
         let tile_results: Vec<Vec<usize>> = (0..tile_rows)
@@ -167,6 +177,10 @@ pub fn compute_knn_gpu(data: &Array2<f64>, k: usize) -> Array2<usize> {
             })
             .collect();
 
+        if row_start == 0 {
+            eprintln!("  First tile: download {}ms, top-k {}ms", dl_ms, t_topk.elapsed().as_millis());
+        }
+
         for (ti, neighbors) in tile_results.iter().enumerate() {
             let i = row_start + ti;
             for (idx, &nb) in neighbors.iter().enumerate() {
@@ -182,6 +196,11 @@ pub fn compute_knn_gpu(data: &Array2<f64>, k: usize) -> Array2<usize> {
 
 #[cfg(not(feature = "cuda"))]
 pub fn compute_knn_gpu(_data: &Array2<f64>, _k: usize) -> Array2<usize> {
+    panic!("GPU kNN requires the 'cuda' feature: cargo build --features cuda")
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn compute_knn_gpu_tile(_data: &Array2<f64>, _k: usize, _tile_mb: usize) -> Array2<usize> {
     panic!("GPU kNN requires the 'cuda' feature: cargo build --features cuda")
 }
 
