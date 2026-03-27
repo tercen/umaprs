@@ -363,7 +363,9 @@ pub fn run_tsne(
     embedding
 }
 
-/// Run t-SNE on compressed data (TQ distances for kNN + P matrix)
+/// Run t-SNE on compressed data — memory efficient.
+/// Computes kNN distances on-the-fly from compressed representation,
+/// never materializes the full kNN distance matrix.
 pub fn run_tsne_compressed(
     qdata: &crate::quantize::QuantizedData,
     perplexity: f64,
@@ -380,26 +382,20 @@ pub fn run_tsne_compressed(
     eprintln!("  kNN from compressed distances...");
     let knn = crate::compressed::knn_compressed(qdata, k);
 
-    // Compute distances from compressed data
-    let mut knn_dists = Array2::zeros((n, k));
-    for i in 0..n {
-        for ki in 0..k {
-            let j = knn[[i, ki]];
-            knn_dists[[i, ki]] = (qdata.approx_dist_sq(i, j) as f64).sqrt();
-        }
-    }
-
-    // P matrix
-    eprintln!("  Computing P matrix...");
-    let (p_rows, p_cols, p_vals) = compute_p_matrix(&knn, &knn_dists, perplexity);
+    // Compute P matrix directly from compressed distances — no kNN distance matrix
+    eprintln!("  Computing P matrix (on-the-fly distances)...");
+    let (p_rows, p_cols, p_vals) = compute_p_matrix_compressed(&knn, qdata, perplexity);
     eprintln!("  {} non-zero P entries", p_rows.len());
 
-    // PCA init from dequantized data
+    // Drop knn — no longer needed
+    drop(knn);
+
+    // PCA init
     eprintln!("  PCA initialization...");
     let mut embedding = crate::compressed::pca_compressed(qdata, 2, random_state);
     embedding.mapv_inplace(|x| x * 0.01);
 
-    // Optimize with Barnes-Hut
+    // Optimize
     eprintln!("  Optimizing ({} iterations, Barnes-Hut theta=0.5)...", n_iter);
     tsne_optimize_bh(
         &mut embedding,
@@ -412,6 +408,92 @@ pub fn run_tsne_compressed(
     );
 
     embedding
+}
+
+/// Compute P matrix directly from compressed data — no intermediate distance matrix.
+/// For each point, binary-search sigma using on-the-fly TQ distances to kNN neighbors.
+fn compute_p_matrix_compressed(
+    knn_indices: &Array2<usize>,
+    qdata: &crate::quantize::QuantizedData,
+    perplexity: f64,
+) -> (Vec<usize>, Vec<usize>, Vec<f64>) {
+    let n = knn_indices.nrows();
+    let k = knn_indices.ncols();
+    let target_entropy = perplexity.ln();
+
+    let mut rows = Vec::new();
+    let mut cols = Vec::new();
+    let mut vals = Vec::new();
+
+    for i in 0..n {
+        // Compute distances on-the-fly from compressed data
+        let mut dists = Vec::with_capacity(k);
+        for ki in 0..k {
+            let j = knn_indices[[i, ki]];
+            dists.push((qdata.approx_dist_sq(i, j) as f64).sqrt());
+        }
+
+        // Binary search for sigma
+        let mut lo = 1e-10f64;
+        let mut hi = 1e4f64;
+        let mut sigma = 1.0;
+
+        for _ in 0..64 {
+            sigma = (lo + hi) / 2.0;
+            let beta = 1.0 / (2.0 * sigma * sigma);
+
+            let mut sum_exp = 0.0;
+            for &d in &dists {
+                sum_exp += (-beta * d * d).exp();
+            }
+            if sum_exp < 1e-20 { lo = sigma; continue; }
+
+            let mut entropy = 0.0;
+            for &d in &dists {
+                let p = (-beta * d * d).exp() / sum_exp;
+                if p > 1e-20 { entropy -= p * p.ln(); }
+            }
+
+            if (entropy - target_entropy).abs() < 1e-5 { break; }
+            if entropy > target_entropy { hi = sigma; } else { lo = sigma; }
+        }
+
+        // Final probabilities
+        let beta = 1.0 / (2.0 * sigma * sigma);
+        let mut sum_exp = 0.0;
+        for &d in &dists {
+            sum_exp += (-beta * d * d).exp();
+        }
+
+        for ki in 0..k {
+            let j = knn_indices[[i, ki]];
+            let p = (-beta * dists[ki] * dists[ki]).exp() / sum_exp.max(1e-20);
+            if p > 1e-12 {
+                rows.push(i);
+                cols.push(j);
+                vals.push(p);
+            }
+        }
+    }
+
+    // Symmetrize
+    let mut sym: std::collections::HashMap<(usize, usize), f64> = std::collections::HashMap::new();
+    for idx in 0..rows.len() {
+        *sym.entry((rows[idx], cols[idx])).or_insert(0.0) += vals[idx];
+        *sym.entry((cols[idx], rows[idx])).or_insert(0.0) += vals[idx];
+    }
+
+    let scale = 1.0 / (2.0 * n as f64);
+    let mut s_rows = Vec::new();
+    let mut s_cols = Vec::new();
+    let mut s_vals = Vec::new();
+    for (&(i, j), &v) in &sym {
+        s_vals.push((v * scale).max(1e-12));
+        s_rows.push(i);
+        s_cols.push(j);
+    }
+
+    (s_rows, s_cols, s_vals)
 }
 
 #[cfg(test)]
