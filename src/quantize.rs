@@ -6,6 +6,7 @@ use rand::Rng;
 use crate::codebook::solve_lloyd_max;
 use std::sync::OnceLock;
 
+
 /// Cached Lloyd-Max codebook for N(0,1). Solved once, reused for all encodes.
 fn solve_lloyd_max_n01(n_levels: usize) -> (Vec<f32>, Vec<f32>) {
     static CACHE_8: OnceLock<(Vec<f32>, Vec<f32>)> = OnceLock::new();
@@ -117,6 +118,10 @@ pub struct QuantizedData {
     qjl_rotation_signs: Vec<f32>,
     /// QJL: global ||r||² per coordinate (constant approximation after WHT)
     qjl_r_norm_sq_per_coord: f32,
+    /// QJL: per-point ||r|| (optional, f32)
+    /// When present, used instead of global constant for QJL correction.
+    /// Cost: 4 bytes per point. For 1M points = 4 MB.
+    residual_norms: Option<Vec<f32>>,
 }
 
 
@@ -156,6 +161,7 @@ impl QuantizedData {
 
         let mut norms = Vec::with_capacity(n_samples);
         let mut total_r_sq = 0.0f64;
+        let mut per_point_r_norms = Vec::with_capacity(n_samples);
         let bytes_per_point = match bits {
             QuantBits::Four => padded_dims / 2,
             QuantBits::Eight => padded_dims,
@@ -203,6 +209,10 @@ impl QuantizedData {
                 }
             }
 
+            // Per-point ||r||
+            let r_norm: f32 = residual.iter().map(|&v| v * v).sum::<f32>().sqrt();
+            per_point_r_norms.push(r_norm);
+
             // Stage 2: QJL — project residual through randomized Hadamard S
             // S = diag(qjl_signs) · WHT — orthogonal, so S·S^T = I exactly
             // q = sign(S · residual)
@@ -247,6 +257,7 @@ impl QuantizedData {
             boundaries,
             qjl_rotation_signs: qjl_signs,
             qjl_r_norm_sq_per_coord: mse_per_coord,
+            residual_norms: Some(per_point_r_norms),
         }
     }
 
@@ -351,17 +362,16 @@ impl QuantizedData {
             }
         };
 
-        // QJL correction for inner product of two reconstructions:
-        //   <x̃_qjl_x, x̃_qjl_y> = (√(π/2)/d)² · q_x^T · S · S^T · q_y
-        //   S is orthogonal (randomized Hadamard): S·S^T = I
-        //   = (π/2)/d² · <q_x, q_y>
-        // Full: ||r_x||·||r_y|| · (π/2)/d² · sign_agreement
-        // With ||r_x||·||r_y|| ≈ d · mse_per_coord:
-        //   = mse_per_coord · (π/2)/d · sign_agreement
+        // QJL correction: (π/2)/d² · ||r_i||·||r_j|| · sign_agreement
+        // S is orthogonal (randomized Hadamard): S·S^T = I exactly
         let d = self.padded_dims as f32;
         let agreement = d - 2.0 * sign_disagree as f32;
         const PI_OVER_2: f32 = 1.5707964;
-        let r_norm_product = d * self.qjl_r_norm_sq_per_coord;
+
+        let r_norm_product = match &self.residual_norms {
+            Some(norms) => norms[i] * norms[j],           // per-point (accurate)
+            None => d * self.qjl_r_norm_sq_per_coord,      // global constant (approximate)
+        };
         let qjl = PI_OVER_2 / (d * d) * r_norm_product * agreement;
 
         let corrected_dot = mse_dot + qjl;
