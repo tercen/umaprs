@@ -51,5 +51,11 @@ fn main() {
         let emb = umap.fit_transform_compressed(&data, QuantBits::Eight);
         println!("TQ8 compressed:      {:.3}s", t.elapsed().as_secs_f64());
         save(&emb, &format!("results/aml_{}_tq8.csv", pct));
+
+        // 5. TQ12 compressed
+        let t = Instant::now();
+        let emb = umap.fit_transform_compressed(&data, QuantBits::Twelve);
+        println!("TQ12 compressed:     {:.3}s", t.elapsed().as_secs_f64());
+        save(&emb, &format!("results/aml_{}_tq12.csv", pct));
     }
 }

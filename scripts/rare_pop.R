@@ -15,7 +15,8 @@ for (pct in c("01pct", "1pct")) {
     embs <- list(
         "Standard\n(exact, 12 MB)"   = read_if(sprintf("results/aml_%s_standard.csv", pct)),
         "Subsample 14%\n(~1.7 MB)"   = read_if(sprintf("results/aml_%s_sub14.csv", pct)),
-        "TQ8 compressed\n(1.7 MB)"   = read_if(sprintf("results/aml_%s_tq8.csv", pct)),
+        "TQ8\n(1.7 MB)"              = read_if(sprintf("results/aml_%s_tq8.csv", pct)),
+        "TQ12\n(3.1 MB)"             = read_if(sprintf("results/aml_%s_tq12.csv", pct)),
         "Subsample 8%\n(~1.0 MB)"    = read_if(sprintf("results/aml_%s_sub8.csv", pct))
     )
 
