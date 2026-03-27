@@ -438,6 +438,31 @@ pub fn tsne_optimize(
     }
 }
 
+/// t-SNE parameters
+pub struct TsneParams {
+    pub perplexity: f64,
+    pub n_iter: usize,
+    pub learning_rate: f64,
+    pub early_exaggeration: f64,
+    pub early_exaggeration_iter: usize,
+    pub theta: f64,
+    pub random_state: Option<u64>,
+}
+
+impl Default for TsneParams {
+    fn default() -> Self {
+        Self {
+            perplexity: 30.0,
+            n_iter: 1000,
+            learning_rate: 200.0,
+            early_exaggeration: 12.0,
+            early_exaggeration_iter: 250,
+            theta: 0.5,
+            random_state: None,
+        }
+    }
+}
+
 /// Run t-SNE on data with given kNN indices
 pub fn run_tsne(
     data: &Array2<f64>,
@@ -447,40 +472,45 @@ pub fn run_tsne(
     learning_rate: f64,
     random_state: Option<u64>,
 ) -> Array2<f64> {
+    run_tsne_params(data, knn_indices, &TsneParams {
+        perplexity, n_iter, learning_rate, random_state, ..Default::default()
+    })
+}
+
+/// Run t-SNE with full parameter control
+pub fn run_tsne_params(
+    data: &Array2<f64>,
+    knn_indices: &Array2<usize>,
+    params: &TsneParams,
+) -> Array2<f64> {
     let n = data.nrows();
 
-    eprintln!("t-SNE: {} points, perplexity={}", n, perplexity);
+    eprintln!("t-SNE: {} points, perplexity={}, exag={}, exag_iter={}",
+              n, params.perplexity, params.early_exaggeration, params.early_exaggeration_iter);
 
-    // Compute kNN distances
     let knn_dists = compute_knn_dists(data, knn_indices);
 
-    // Compute P matrix
     eprintln!("  Computing P matrix...");
-    let (p_rows, p_cols, p_vals) = compute_p_matrix(knn_indices, &knn_dists, perplexity);
+    let (p_rows, p_cols, p_vals) = compute_p_matrix(knn_indices, &knn_dists, params.perplexity);
     eprintln!("  {} non-zero P entries", p_rows.len());
 
-    // Initialize with PCA
     eprintln!("  PCA initialization...");
-    let mut embedding = crate::spectral::pca_initialization(data, 2, random_state);
-
-    // Scale down for t-SNE (typical initial scale ~0.01)
+    let mut embedding = crate::spectral::pca_initialization(data, 2, params.random_state);
     embedding.mapv_inplace(|x| x * 0.01);
 
-    // Compact P matrix
     let compact = CompactP::from_triplets(n, &p_rows, &p_cols, &p_vals);
-    eprintln!("  P matrix: {} MB (compact CSR)", compact.memory_bytes() / 1024 / 1024);
+    eprintln!("  P matrix: {} MB", compact.memory_bytes() / 1024 / 1024);
     drop(p_rows); drop(p_cols); drop(p_vals);
 
-    // Optimize with Barnes-Hut
-    eprintln!("  Optimizing ({} iterations, Barnes-Hut theta=0.5)...", n_iter);
+    eprintln!("  Optimizing ({} iterations, theta={})...", params.n_iter, params.theta);
     tsne_optimize_bh_compact(
         &mut embedding,
         &compact,
-        n_iter,
-        learning_rate,
-        12.0,
-        250,
-        0.5,
+        params.n_iter,
+        params.learning_rate,
+        params.early_exaggeration,
+        params.early_exaggeration_iter,
+        params.theta,
     );
 
     embedding
