@@ -9,30 +9,28 @@ labels <- read.csv("data/cyto_labels.csv")
 n <- nrow(data)
 cat(sprintf("CyTOF: %d cells x %d markers, %d populations\n\n", n, ncol(data), length(unique(labels$population))))
 
-# uwot
 set.seed(42)
 t0 <- proc.time()
 emb <- umap(data, n_neighbors=15, n_components=2, min_dist=0.1, n_epochs=200, verbose=FALSE)
 t_uwot <- (proc.time() - t0)["elapsed"]
 uwot_emb <- data.frame(V1=emb[,1], V2=emb[,2])
 
-# Read Rust timings
 timings <- read.csv("results/timings.csv")
-
-# Read all embeddings that exist
 read_if <- function(path) if (file.exists(path)) read.csv(path) else NULL
-embs <- list(
-    "kd-tree"     = read_if("results/cyto_emb_kdtree.csv"),
-    "TQ4+QJL"  = read_if("results/cyto_emb_tq4.csv"),
-    "TQ8+QJL"  = read_if("results/cyto_emb_tq8.csv"),
-    "train 10%"   = read_if("results/cyto_emb_train10.csv"),
-    "GPU f32"      = read_if("results/cyto_emb_gpu.csv"),
-    "GPU TQ4"      = read_if("results/cyto_emb_gpu_tq4.csv"),
-    "GPU TQ8"      = read_if("results/cyto_emb_gpu_tq8.csv")
-)
-embs[["R uwot"]] <- uwot_emb
 
-# Separation metric
+# Ordered: kd-tree, TQ4 CPU, TQ4 GPU, TQ8 CPU, TQ8 GPU, train 10%, uwot
+ordered_methods <- c("kd-tree", "TQ4+QJL", "GPU TQ4", "TQ8+QJL", "GPU TQ8", "train 10%", "R uwot")
+
+embs <- list(
+    "kd-tree"    = read_if("results/cyto_emb_kdtree.csv"),
+    "TQ4+QJL"   = read_if("results/cyto_emb_tq4.csv"),
+    "GPU TQ4"    = read_if("results/cyto_emb_gpu_tq4.csv"),
+    "TQ8+QJL"   = read_if("results/cyto_emb_tq8.csv"),
+    "GPU TQ8"    = read_if("results/cyto_emb_gpu_tq8.csv"),
+    "train 10%"  = read_if("results/cyto_emb_train10.csv"),
+    "R uwot"     = uwot_emb
+)
+
 calc_sep <- function(emb) {
     set.seed(1); w <- c(); b <- c()
     for (p in 1:80000) { i <- sample(n,1); j <- sample(n,1); if(i==j) next
@@ -41,9 +39,8 @@ calc_sep <- function(emb) {
     mean(b)/mean(w)
 }
 
-# Compute separation and get timing for each
 results <- data.frame(method=character(), sep=numeric(), time=numeric(), stringsAsFactors=FALSE)
-for (name in names(embs)) {
+for (name in ordered_methods) {
     if (is.null(embs[[name]])) next
     sep <- calc_sep(embs[[name]])
     t <- if (name == "R uwot") t_uwot else {
@@ -53,11 +50,10 @@ for (name in names(embs)) {
     results <- rbind(results, data.frame(method=name, sep=sep, time=t))
 }
 
-# Print table
-cat(sprintf("\n%-18s %8s %6s %8s\n", "Method", "Sep", "vs uwot", "Time"))
 uwot_sep <- results$sep[results$method == "R uwot"]
+cat(sprintf("\n%-14s %8s %6s %8s\n", "Method", "Sep", "vs uwot", "Time"))
 for (i in 1:nrow(results)) {
-    cat(sprintf("%-18s %8.3f %5.0f%% %7.1fs\n",
+    cat(sprintf("%-14s %8.3f %5.0f%% %7.1fs\n",
         results$method[i], results$sep[i], 100*results$sep[i]/uwot_sep, results$time[i]))
 }
 
@@ -88,7 +84,6 @@ for (i in 1:nrow(results)) {
     plots[[length(plots)+1]] <- p
 }
 
-# Legend
 df_leg <- data.frame(x=0, y=0, pop=factor(1:14))
 p_leg <- ggplot(df_leg, aes(x=x,y=y,color=pop)) + geom_point(size=3) +
     scale_color_manual(values=pop_colors, name="Population") +
@@ -97,9 +92,7 @@ p_leg <- ggplot(df_leg, aes(x=x,y=y,color=pop)) + geom_point(size=3) +
 legend <- get_legend(p_leg)
 
 ncols <- length(plots)
-width <- ncols * 480
-
-png("results/cyto_all_final.png", width=width, height=700, res=120)
+png("results/cyto_all_final.png", width=ncols*420, height=700, res=120)
 grid.arrange(
     do.call(arrangeGrob, c(plots, list(ncol=ncols))),
     legend, nrow=2, heights=c(5,1)

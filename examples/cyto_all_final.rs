@@ -69,10 +69,6 @@ fn main() {
 
     #[cfg(feature = "cuda")]
     {
-        run(&data, "GPU f32", "results/cyto_emb_gpu.csv",
-            &UMAP::new().n_neighbors(15).n_epochs(200).random_state(42).knn_method(KnnMethod::Gpu),
-            &mut timings);
-
         run(&data, "GPU TQ4", "results/cyto_emb_gpu_tq4.csv",
             &UMAP::new().n_neighbors(15).n_epochs(200).random_state(42).knn_method(KnnMethod::GpuTQ4),
             &mut timings);
