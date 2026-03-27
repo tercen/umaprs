@@ -12,6 +12,7 @@ mod quantize;
 mod sparse;
 mod spectral;
 mod optimize;
+pub mod tsne;
 
 pub use knn::{compute_knn_graph, compute_knn_bruteforce, compute_knn_hnsw_f32};
 pub use fuzzy::compute_fuzzy_simplicial_set;
