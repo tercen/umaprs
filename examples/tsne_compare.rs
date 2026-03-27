@@ -44,6 +44,13 @@ fn main() {
     println!("t-SNE TQ8:          {:.3}s", t.elapsed().as_secs_f64());
     save(&emb, "results/tsne_tq8.csv");
 
+    // t-SNE compressed TQ4
+    let t = Instant::now();
+    let qdata4 = QuantizedData::encode_with_bits(&data, 42, QuantBits::Four);
+    let emb = tsne::run_tsne_compressed(&qdata4, perplexity, 1000, 200.0, Some(42));
+    println!("t-SNE TQ4:          {:.3}s", t.elapsed().as_secs_f64());
+    save(&emb, "results/tsne_tq4.csv");
+
     // UMAP for comparison
     let t = Instant::now();
     let emb = UMAP::new().n_neighbors(15).n_epochs(200).random_state(42).fit_transform(&data);
