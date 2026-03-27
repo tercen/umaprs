@@ -3,16 +3,12 @@ use rayon::prelude::*;
 
 use crate::hnsw::Hnsw;
 use crate::kdtree::KdTree;
-use crate::quantize::{QuantizedData, QuantBits};
 
 /// Threshold for switching from brute-force to tree-based methods
 const TREE_THRESHOLD: usize = 500;
 
 /// Max dimensions for kd-tree (above this, HNSW is better)
 const KDTREE_MAX_DIMS: usize = 40;
-
-/// Minimum dimensions for TurboQuant to be effective
-const QUANT_MIN_DIMS: usize = 16;
 
 /// Compute k-nearest neighbors for each point.
 /// Strategy:
@@ -64,68 +60,6 @@ pub fn compute_knn_bruteforce(data: &Array2<f64>, k: usize) -> Array2<usize> {
     knn_indices
 }
 
-/// TurboQuant + HNSW (4-bit)
-pub fn compute_knn_quant_hnsw(data: &Array2<f64>, k: usize) -> Array2<usize> {
-    compute_knn_quant_hnsw_bits(data, k, QuantBits::Four)
-}
-
-/// TurboQuant + HNSW (8-bit)
-pub fn compute_knn_quant_hnsw_8bit(data: &Array2<f64>, k: usize) -> Array2<usize> {
-    compute_knn_quant_hnsw_bits(data, k, QuantBits::Eight)
-}
-
-fn compute_knn_quant_hnsw_bits(data: &Array2<f64>, k: usize, bits: QuantBits) -> Array2<usize> {
-    let n_samples = data.nrows();
-
-    let qdata = QuantizedData::encode_with_bits(data, 42, bits);
-
-    let original_bytes = n_samples * data.ncols() * 8;
-    let quant_bytes = qdata.memory_bytes();
-    eprintln!(
-        "  Memory: {} KB -> {} KB ({:.1}x compression)",
-        original_bytes / 1024,
-        quant_bytes / 1024,
-        original_bytes as f64 / quant_bytes as f64
-    );
-
-    // Build HNSW with squared distance — skip sqrt, ordering is preserved
-    let dist_sq_fn = |i: u32, j: u32| -> f32 {
-        qdata.approx_dist_sq(i as usize, j as usize)
-    };
-    let hnsw = Hnsw::build(n_samples, &dist_sq_fn, 42);
-
-    // Search: approximate top-2k from HNSW, refine with exact distances
-    let refine_k = (k * 2).min(n_samples - 1);
-    let mut knn_indices = Array2::zeros((n_samples, k));
-
-    knn_indices
-        .outer_iter_mut()
-        .enumerate()
-        .par_bridge()
-        .for_each(|(i, mut row)| {
-            let results = hnsw.search(i as u32, refine_k + 1, &dist_sq_fn);
-
-            let candidates: Vec<usize> = results
-                .iter()
-                .map(|&(id, _)| id as usize)
-                .filter(|&j| j != i)
-                .collect();
-
-            let point = data.row(i);
-            let mut exact_dists: Vec<(usize, f64)> = candidates
-                .iter()
-                .map(|&j| (j, euclidean_distance(point, data.row(j))))
-                .collect();
-            exact_dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-
-            for (idx, &(neighbor, _)) in exact_dists.iter().take(k).enumerate() {
-                row[idx] = neighbor;
-            }
-        });
-
-    knn_indices
-}
-
 /// kd-tree exact kNN — O(n log n) build, O(k log n) query. Exact results.
 pub fn compute_knn_kdtree(data: &Array2<f64>, k: usize) -> Array2<usize> {
     let n_samples = data.nrows();
@@ -147,63 +81,6 @@ pub fn compute_knn_kdtree(data: &Array2<f64>, k: usize) -> Array2<usize> {
         });
 
     knn_indices
-}
-
-/// TurboQuant brute-force: uses approx_dist_sq (MSE + QJL correction) directly.
-/// No dequantization — works on packed data. O(n²) but cache-friendly on compressed data.
-pub fn compute_knn_quant_bruteforce(data: &Array2<f64>, k: usize, bits: QuantBits) -> Array2<usize> {
-    let n = data.nrows();
-    let qdata = QuantizedData::encode_with_bits(data, 42, bits);
-
-    let original_bytes = n * data.ncols() * 8;
-    let quant_bytes = qdata.memory_bytes();
-    eprintln!(
-        "  TQ {:?} brute-force: {} KB -> {} KB ({:.1}x compression)",
-        bits, original_bytes / 1024, quant_bytes / 1024,
-        original_bytes as f64 / quant_bytes as f64
-    );
-
-    let refine_k = (k * 2).min(n - 1);
-    let mut knn_indices = Array2::zeros((n, k));
-
-    knn_indices
-        .outer_iter_mut()
-        .enumerate()
-        .par_bridge()
-        .for_each(|(i, mut row)| {
-            // Phase 1: approximate distances using quantized data (MSE + QJL)
-            let mut dists: Vec<(usize, f32)> = (0..n)
-                .filter(|&j| j != i)
-                .map(|j| (j, qdata.approx_dist_sq(i, j)))
-                .collect();
-
-            // Get top 2k candidates
-            dists.select_nth_unstable_by(refine_k, |a, b| a.1.partial_cmp(&b.1).unwrap());
-            dists.truncate(refine_k);
-
-            // Phase 2: refine with exact f64 distances
-            let point = data.row(i);
-            let mut exact: Vec<(usize, f64)> = dists.iter()
-                .map(|&(j, _)| (j, euclidean_distance(point, data.row(j))))
-                .collect();
-            exact.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-
-            for (idx, &(neighbor, _)) in exact.iter().take(k).enumerate() {
-                row[idx] = neighbor;
-            }
-        });
-
-    knn_indices
-}
-
-/// TQ 4-bit brute-force (MSE + QJL correction)
-pub fn compute_knn_quant4_bruteforce(data: &Array2<f64>, k: usize) -> Array2<usize> {
-    compute_knn_quant_bruteforce(data, k, QuantBits::Four)
-}
-
-/// TQ 8-bit brute-force (MSE + QJL correction)
-pub fn compute_knn_quant8_bruteforce(data: &Array2<f64>, k: usize) -> Array2<usize> {
-    compute_knn_quant_bruteforce(data, k, QuantBits::Eight)
 }
 
 /// Plain HNSW with f32 distances (no quantization)
@@ -288,22 +165,4 @@ mod tests {
         assert_eq!(knn[[3, 0]], 4);
     }
 
-    #[test]
-    fn test_knn_quant_bruteforce() {
-        // TQ brute-force on orthogonal clusters (d=32, 8-bit for reliability)
-        let d = 32;
-        let n = 20;
-        let mut data_vec = vec![0.0f64; n * d];
-        for i in 0..10 {
-            for j in 0..16 { data_vec[i * d + j] = 10.0 + (i as f64) * 0.5 + (j as f64 * 0.1); }
-        }
-        for i in 10..20 {
-            for j in 16..32 { data_vec[i * d + j] = 10.0 + (i as f64) * 0.5 + (j as f64 * 0.1); }
-        }
-        let data = Array2::from_shape_vec((n, d), data_vec).unwrap();
-        let knn = compute_knn_quant8_bruteforce(&data, 2);
-        assert_eq!(knn.shape(), &[n, 2]);
-        assert!(knn[[0, 0]] < 10, "point 0 neighbor got {}", knn[[0, 0]]);
-        assert!(knn[[10, 0]] >= 10, "point 10 neighbor got {}", knn[[10, 0]]);
-    }
 }

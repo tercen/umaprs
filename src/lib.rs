@@ -13,7 +13,7 @@ mod sparse;
 mod spectral;
 mod optimize;
 
-pub use knn::{compute_knn_graph, compute_knn_bruteforce, compute_knn_quant_hnsw, compute_knn_quant_hnsw_8bit, compute_knn_hnsw_f32, compute_knn_quant4_bruteforce, compute_knn_quant8_bruteforce};
+pub use knn::{compute_knn_graph, compute_knn_bruteforce, compute_knn_hnsw_f32};
 pub use fuzzy::compute_fuzzy_simplicial_set;
 pub use spectral::{spectral_layout, spectral_layout_with_data};
 pub use optimize::optimize_layout;
@@ -43,12 +43,6 @@ pub enum KnnMethod {
     BruteForce,
     KdTree,
     Hnsw,
-    /// TurboQuant 4-bit brute-force (MSE + QJL, on packed data)
-    TurboQuant4,
-    /// TurboQuant 8-bit brute-force (MSE + QJL, on packed data)
-    TurboQuant8,
-    TurboQuant4Hnsw,
-    TurboQuant8Hnsw,
     /// GPU brute-force via cuBLAS (requires 'cuda' feature)
     Gpu,
     /// GPU TQ4: packed 4-bit dot products via CUDA kernel (16x less GPU memory)
@@ -165,10 +159,6 @@ impl UMAP {
             KnnMethod::BruteForce => compute_knn_bruteforce(data, k),
             KnnMethod::KdTree => knn::compute_knn_kdtree(data, k),
             KnnMethod::Hnsw => compute_knn_hnsw_f32(data, k),
-            KnnMethod::TurboQuant4 => compute_knn_quant4_bruteforce(data, k),
-            KnnMethod::TurboQuant8 => compute_knn_quant8_bruteforce(data, k),
-            KnnMethod::TurboQuant4Hnsw => compute_knn_quant_hnsw(data, k),
-            KnnMethod::TurboQuant8Hnsw => compute_knn_quant_hnsw_8bit(data, k),
             KnnMethod::Gpu => gpu::compute_knn_gpu(data, k),
             KnnMethod::GpuTQ4 => gpu::compute_knn_gpu_tq4(data, k),
             KnnMethod::GpuTQ8 => gpu::compute_knn_gpu_tq8(data, k),

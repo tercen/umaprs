@@ -1,5 +1,5 @@
 use ndarray::Array2;
-use umaprs::{UMAP, KnnMethod, compute_knn_quant4_bruteforce, compute_knn_quant8_bruteforce};
+use umaprs::{UMAP, KnnMethod, QuantBits};
 use std::fs::File;
 use std::io::{Write, BufReader, BufRead};
 use std::time::Instant;
@@ -23,16 +23,7 @@ fn run(data: &Array2<f64>, name: &str, path: &str, umap: &UMAP, timings: &mut Ve
     let t = Instant::now();
     let emb = umap.fit_transform(data);
     let elapsed = t.elapsed().as_secs_f64();
-    println!("{:<18} {:.3}s", name, elapsed);
-    save(&emb, path);
-    timings.push((name.to_string(), elapsed));
-}
-
-fn run_knn(data: &Array2<f64>, name: &str, path: &str, knn: &Array2<usize>, umap: &UMAP, timings: &mut Vec<(String, f64)>) {
-    let t = Instant::now();
-    let emb = umap.fit_transform_with_knn(data, knn);
-    let elapsed = t.elapsed().as_secs_f64();
-    println!("{:<18} {:.3}s", name, elapsed);
+    println!("{:<20} {:.3}s", name, elapsed);
     save(&emb, path);
     timings.push((name.to_string(), elapsed));
 }
@@ -44,31 +35,29 @@ fn main() {
     let umap = UMAP::new().n_neighbors(15).n_epochs(200).random_state(42);
     let mut timings: Vec<(String, f64)> = Vec::new();
 
+    // Standard (kd-tree, exact)
     run(&data, "kd-tree", "results/cyto_emb_kdtree.csv", &umap, &mut timings);
 
+    // Compressed TQ8 (no original data)
     let t = Instant::now();
-    let knn = compute_knn_quant4_bruteforce(&data, 15);
-    let emb = umap.fit_transform_with_knn(&data, &knn);
+    let emb = umap.fit_transform_compressed(&data, QuantBits::Eight);
     let elapsed = t.elapsed().as_secs_f64();
-    println!("{:<18} {:.3}s", "TQ4+QJL", elapsed);
-    save(&emb, "results/cyto_emb_tq4.csv");
-    timings.push(("TQ4+QJL".into(), elapsed));
-
-    let t = Instant::now();
-    let knn = compute_knn_quant8_bruteforce(&data, 15);
-    let emb = umap.fit_transform_with_knn(&data, &knn);
-    let elapsed = t.elapsed().as_secs_f64();
-    println!("{:<18} {:.3}s", "TQ8+QJL", elapsed);
+    println!("{:<20} {:.3}s", "Compressed TQ8", elapsed);
     save(&emb, "results/cyto_emb_tq8.csv");
-    timings.push(("TQ8+QJL".into(), elapsed));
+    timings.push(("Compressed TQ8".to_string(), elapsed));
 
-    run(&data, "train 10%",
-        "results/cyto_emb_train10.csv",
+    // train 10%
+    run(&data, "train 10%", "results/cyto_emb_train10.csv",
         &UMAP::new().n_neighbors(15).n_epochs(200).random_state(42).train_size(0.1),
         &mut timings);
 
+    // GPU (if cuda feature enabled)
     #[cfg(feature = "cuda")]
     {
+        run(&data, "GPU f32", "results/cyto_emb_gpu.csv",
+            &UMAP::new().n_neighbors(15).n_epochs(200).random_state(42).knn_method(KnnMethod::Gpu),
+            &mut timings);
+
         run(&data, "GPU TQ4", "results/cyto_emb_gpu_tq4.csv",
             &UMAP::new().n_neighbors(15).n_epochs(200).random_state(42).knn_method(KnnMethod::GpuTQ4),
             &mut timings);
@@ -78,10 +67,7 @@ fn main() {
             &mut timings);
     }
 
-    // Write timings CSV for R
     let mut f = File::create("results/timings.csv").unwrap();
     writeln!(f, "method,time").unwrap();
-    for (name, time) in &timings {
-        writeln!(f, "{},{:.3}", name, time).unwrap();
-    }
+    for (name, time) in &timings { writeln!(f, "{},{:.3}", name, time).unwrap(); }
 }
