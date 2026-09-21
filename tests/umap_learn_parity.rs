@@ -160,3 +160,14 @@ fn the_graph_is_deterministic_across_thread_counts() {
         );
     }
 }
+
+#[test]
+fn ab_params_match_find_ab_params() {
+    // (min_dist, spread, a, b) from scipy's curve_fit
+    for row in fixture("ab_params") {
+        let (md, sp, a, b) = (row[0], row[1], row[2], row[3]);
+        let (ga, gb) = umaprs::find_ab_params(md, sp);
+        assert_close(ga, a, 1e-4, &format!("a at min_dist {md} spread {sp}"));
+        assert_close(gb, b, 1e-4, &format!("b at min_dist {md} spread {sp}"));
+    }
+}

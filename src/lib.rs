@@ -19,6 +19,10 @@ pub use fuzzy::compute_fuzzy_simplicial_set;
 pub use knn::{compute_knn_bruteforce, compute_knn_graph, compute_knn_hnsw_f32};
 pub use model::{SamplingStrategy, UmapModel};
 pub use optimize::optimize_layout;
+/// `umap-learn`'s curve fit for `a`, `b`; exposed so the fit can be checked against it.
+pub fn find_ab_params(min_dist: f64, spread: f64) -> (f64, f64) {
+    optimize::find_ab_params(min_dist, spread)
+}
 pub use quantize::{QuantBits, QuantizedData};
 pub use sparse::SparseGraph;
 pub use spectral::{spectral_layout, spectral_layout_with_data};

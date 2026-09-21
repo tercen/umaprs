@@ -7,23 +7,94 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::sparse::SparseGraph;
 
-/// Fit the UMAP curve parameters a and b from min_dist and spread
+/// Fit the curve parameters `a`, `b` from `min_dist` and `spread` — `umap-learn`'s
+/// `find_ab_params`, not a table.
+///
+/// The target is the piecewise curve `y = 1` for `x < min_dist`, `exp(-(x - min_dist)/spread)`
+/// after, sampled at 300 points on `[0, 3·spread]`, and `1 / (1 + a·x^(2b))` is fitted to it
+/// by Levenberg–Marquardt from `(1, 1)`, which is what `scipy.optimize.curve_fit` does with
+/// its defaults. The table this replaces was exact at 0.1, off by 1.8% / 1.1% at 0.01, and by
+/// 92% / 20% at 0.5 — the R operator's default.
 pub(crate) fn find_ab_params(min_dist: f64, spread: f64) -> (f64, f64) {
-    if (min_dist - 0.1).abs() < 1e-6 && (spread - 1.0).abs() < 1e-6 {
-        return (1.577, 0.8951);
-    }
-    if (min_dist - 0.01).abs() < 1e-6 && (spread - 1.0).abs() < 1e-6 {
-        return (1.929, 0.7915);
-    }
-    if (min_dist - 0.5).abs() < 1e-6 && (spread - 1.0).abs() < 1e-6 {
-        return (1.120, 1.068);
-    }
-    let a = if min_dist > 0.0 {
-        (1.0 / 0.4 - 1.0) / spread.powf(2.0 * 0.9)
-    } else {
-        1.577
+    const N: usize = 300;
+    let xs: Vec<f64> = (0..N)
+        .map(|i| spread * 3.0 * i as f64 / (N - 1) as f64)
+        .collect();
+    let ys: Vec<f64> = xs
+        .iter()
+        .map(|&x| {
+            if x < min_dist {
+                1.0
+            } else {
+                (-(x - min_dist) / spread).exp()
+            }
+        })
+        .collect();
+
+    let model = |a: f64, b: f64, x: f64| -> f64 { 1.0 / (1.0 + a * x.powf(2.0 * b)) };
+    let (mut a, mut b) = (1.0f64, 1.0f64);
+    let mut lambda = 1e-3;
+    let mut cost = |a: f64, b: f64| -> f64 {
+        xs.iter()
+            .zip(&ys)
+            .map(|(&x, &y)| (model(a, b, x) - y).powi(2))
+            .sum::<f64>()
     };
-    (a, 0.9)
+    let mut current = cost(a, b);
+    for _ in 0..200 {
+        // J^T J and J^T r with the analytic Jacobian.
+        let (mut jtj00, mut jtj01, mut jtj11, mut jtr0, mut jtr1) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        for (&x, &y) in xs.iter().zip(&ys) {
+            let x2b = if x > 0.0 { x.powf(2.0 * b) } else { 0.0 };
+            let denom = 1.0 + a * x2b;
+            let f = 1.0 / denom;
+            let r = f - y;
+            let dfa = -x2b / (denom * denom);
+            let dfb = if x > 0.0 {
+                -2.0 * a * x2b * x.ln() / (denom * denom)
+            } else {
+                0.0
+            };
+            jtj00 += dfa * dfa;
+            jtj01 += dfa * dfb;
+            jtj11 += dfb * dfb;
+            jtr0 += dfa * r;
+            jtr1 += dfb * r;
+        }
+        // Solve (J^T J + λ diag) δ = -J^T r; accept if the cost drops, else raise λ.
+        let mut accepted = false;
+        for _ in 0..20 {
+            let m00 = jtj00 * (1.0 + lambda);
+            let m11 = jtj11 * (1.0 + lambda);
+            let det = m00 * m11 - jtj01 * jtj01;
+            if det.abs() < 1e-300 {
+                break;
+            }
+            let da = (-jtr0 * m11 + jtr1 * jtj01) / det;
+            let db = (-jtr1 * m00 + jtr0 * jtj01) / det;
+            let (na, nb) = (a + da, b + db);
+            let c = cost(na, nb);
+            if c < current {
+                let converged = (da.abs() < 1e-10 * (1.0 + a.abs())
+                    && db.abs() < 1e-10 * (1.0 + b.abs()))
+                    || (current - c) < 1e-15 * current;
+                a = na;
+                b = nb;
+                current = c;
+                lambda = (lambda / 10.0).max(1e-12);
+                accepted = true;
+                if converged {
+                    return (a, b);
+                }
+                break;
+            }
+            lambda *= 10.0;
+        }
+        if !accepted {
+            break;
+        }
+    }
+    (a, b)
 }
 
 const GRAD_CLAMP_HI: f32 = 4.0;
@@ -150,31 +221,6 @@ pub fn optimize_layout(
 
     // Fast approximate pow matching uwot's fastPrecisePow
     #[inline(always)]
-    fn fast_pow(a: f32, b: f32) -> f32 {
-        let e = b as i32;
-        let frac = b - e as f32;
-        let u: f64 = a as f64;
-        let bits = u.to_bits() as i64;
-        let approx_bits =
-            (frac as f64 * (bits - 4606853616395542528) as f64 + 4606853616395542528.0) as u64;
-        let approx = f64::from_bits(approx_bits);
-        let mut r = 1.0f64;
-        let mut base = a as f64;
-        let mut exp = if e >= 0 { e } else { -e };
-        while exp > 0 {
-            if exp & 1 == 1 {
-                r *= base;
-            }
-            base *= base;
-            exp >>= 1;
-        }
-        if e >= 0 {
-            (r * approx) as f32
-        } else {
-            (approx / r) as f32
-        }
-    }
-
     // Atomic f32 helpers for HogWild! parallel SGD
     #[inline(always)]
     fn atomic_add_f32(atom: &AtomicU32, val: f32) {
@@ -246,7 +292,7 @@ pub fn optimize_layout(
                     let dy = iy - jy;
                     let dist_sq = (dx * dx + dy * dy).max(f32::EPSILON);
 
-                    let pd2b = fast_pow(dist_sq, b);
+                    let pd2b = dist_sq.powf(b);
                     let attr_coeff = (a_b_m2 * pd2b) / (dist_sq * (a * pd2b + 1.0));
 
                     let ux = alpha * clamp_grad(attr_coeff * dx);
@@ -271,7 +317,7 @@ pub fn optimize_layout(
                         let ndist_sq = (ndx * ndx + ndy * ndy).max(f32::EPSILON);
 
                         let rep_coeff =
-                            gamma_b_2 / ((0.001 + ndist_sq) * (a * fast_pow(ndist_sq, b) + 1.0));
+                            gamma_b_2 / ((0.001 + ndist_sq) * (a * ndist_sq.powf(b) + 1.0));
 
                         atomic_add_f32(&emb[i2], alpha * clamp_grad(rep_coeff * ndx));
                         atomic_add_f32(&emb[i2 + 1], alpha * clamp_grad(rep_coeff * ndy));
@@ -352,5 +398,55 @@ mod tests {
         let weights = vec![1.0f32, 0.5, 0.25];
         let sampler = Sampler::new(&weights, 5.0);
         assert!(sampler.is_sample_edge(0, 1.0));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn fast_pow_legacy_probe(a: f32, b: f32) -> f32 {
+    // the original body, verbatim
+    let e = b as i32;
+    let frac = b - e as f32;
+    let u: f64 = a as f64;
+    let bits = u.to_bits() as i64;
+    let approx_bits =
+        (frac as f64 * (bits - 4606853616395542528) as f64 + 4606853616395542528.0) as u64;
+    let approx = f64::from_bits(approx_bits);
+    let mut r = 1.0f64;
+    let mut base = a as f64;
+    let mut exp = if e >= 0 { e } else { -e };
+    while exp > 0 {
+        if exp & 1 == 1 {
+            r *= base;
+        }
+        base *= base;
+        exp >>= 1;
+    }
+    if e >= 0 {
+        (r * approx) as f32
+    } else {
+        (approx / r) as f32
+    }
+}
+
+#[cfg(test)]
+mod pow_tests {
+    /// What the old approximation cost, in one number: its worst relative error over the
+    /// squared distances the gradient sees, at the curve exponent for min_dist = 0.01.
+    #[test]
+    fn the_legacy_fast_pow_was_percent_level_wrong() {
+        let b = 0.8006f32;
+        let mut worst = 0.0f32;
+        let mut x = 1e-7f32;
+        while x < 1e4 {
+            let exact = x.powf(b);
+            let approx = super::fast_pow_legacy_probe(x, b);
+            worst = worst.max(((approx - exact) / exact).abs());
+            x *= 1.05;
+        }
+        assert!(
+            worst > 1e-2,
+            "expected percent-level error, measured {worst:.3e}"
+        );
+        eprintln!("legacy fast_pow worst relative error at b = {b}: {worst:.3e}");
     }
 }
