@@ -27,9 +27,18 @@ fn blobs(n: usize, d: usize, nb: usize, seed: u64) -> Array2<f64> {
     Array2::from_shape_vec((n, d), v).unwrap()
 }
 fn main() {
+    // Optional args: n_train n_new (default 100k / 400k)
+    let a: Vec<usize> = std::env::args()
+        .skip(1)
+        .filter_map(|v| v.parse().ok())
+        .collect();
+    let (n_train, n_new) = (
+        a.first().copied().unwrap_or(100_000),
+        a.get(1).copied().unwrap_or(400_000),
+    );
     let (d, nb) = (40usize, 12usize);
-    let train = blobs(100_000, d, nb, 42);
-    let rest = blobs(400_000, d, nb, 43);
+    let train = blobs(n_train, d, nb, 42);
+    let rest = blobs(n_new, d, nb, 43);
     let t = Instant::now();
     let (emb, model) = umaprs::UMAP::new()
         .n_neighbors(15)
@@ -42,7 +51,7 @@ fn main() {
     let proj = model.transform(&rest);
     let t_tr = t.elapsed().as_secs_f64();
     println!(
-        "fit 100k x {d}: {t_fit:.1} s | transform 400k: {t_tr:.1} s | emb {:?} proj {:?}",
+        "fit {n_train} x {d}: {t_fit:.1} s | transform {n_new}: {t_tr:.1} s | emb {:?} proj {:?}",
         emb.dim(),
         proj.dim()
     );

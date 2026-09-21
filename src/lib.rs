@@ -177,6 +177,14 @@ impl UMAP {
         self.random_state = Some(v);
         self
     }
+    /// Rayon threads for the fit and transform; 0 = all cores. `1` is bit-for-bit
+    /// reproducible run to run (HogWild SGD and the parallel HNSW build both depend on
+    /// scheduling otherwise).
+    pub fn threads(mut self, v: usize) -> Self {
+        self.threads = v;
+        self
+    }
+
     pub fn model_format(mut self, v: ModelFormat) -> Self {
         self.model_format = v;
         self

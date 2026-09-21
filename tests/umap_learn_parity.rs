@@ -304,3 +304,22 @@ fn transform_is_deterministic_at_any_thread_count_and_stays_near_its_init() {
         "projected points wandered {mean_move:.3} against a map spanning {span:.3}"
     );
 }
+
+/// `threads(1)` must reproduce bit-for-bit above the kd-tree cutoff too, where the kNN comes
+/// from the HNSW whose build is parallel in general.
+#[test]
+fn fit_with_one_thread_is_reproducible_on_the_hnsw_path() {
+    use rand::{Rng, SeedableRng};
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(3);
+    let data = ndarray::Array2::from_shape_fn((4000, 24), |_| rng.gen_range(-1.0f64..1.0));
+    let run = || {
+        umaprs::UMAP::new()
+            .n_neighbors(15)
+            .n_epochs(20)
+            .random_state(11)
+            .threads(1)
+            .fit_transform(&data)
+    };
+    let (a, b) = (run(), run());
+    assert_eq!(a.as_slice().unwrap(), b.as_slice().unwrap());
+}
