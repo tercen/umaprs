@@ -38,7 +38,7 @@ same fit is **5.96 s**.
 (`examples/time_transform_stages.rs`): kNN + σ + init **139.4 s**, SGD **0.3 s**. At 40 dims a
 kd-tree barely prunes — 1.4 ms a query is close to a full scan — and the fit's kNN pays the same
 price. The cutoff moved to 16 dims; above it HNSW with an exact 2k refine.
-Same measurement on the HNSW path: kNN + σ + init **16.6 s**, SGD **2.6 s**, whole transform **19.2 s** — seven times faster, and the fit's kNN gains the same way. After the recall fix and the parallel build (below): kNN + σ + init **7.8 s**, whole transform **9.8 s**. At Jamie's 1.2M queries against 465k training cells that is a couple of minutes, not the hour the brute-force scan needed.
+Same measurement on the HNSW path: kNN + σ + init **16.6 s**, SGD **2.6 s**, whole transform **19.2 s** — seven times faster, and the fit's kNN gains the same way. After the recall fix and the parallel build (below): kNN + σ + init **7.8 s**, whole transform **9.8 s**. Measured at cohort scale (`examples/time_transform.rs 465000 1200000`, 40 dims, 16 cores): **fit 465k in 95.7 s, transform 1.2M in 103.7 s** — three and a half minutes for what the brute-force scan would have needed an hour for.
 
 **Before the index existed**, transforming 400k against 100k took 547 s — and would have been an
 hour at Jamie's 1.2M × 465k.
