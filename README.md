@@ -88,8 +88,11 @@ point (`model.transform_seed`, default 42 as upstream) and bit-identical at any 
 `.threads(n)` sizes the rayon pool for kNN, the fuzzy set, the SGD and the transform; `0` (the
 default) leaves rayon its choice, which honours a container's CPU quota. Every stage is
 deterministic by construction or seeded per unit of work except the fit's HogWild SGD, whose
-float summation order depends on the thread count: **`threads(1)` is bit-repeatable; any other
-count is repeatable up to that order** — the same contract as `umap-learn`'s parallel mode.
+float summation order depends on the thread count, and the HNSW index build, whose insertion
+order does: **`threads(1)` is bit-repeatable; any other count is repeatable up to that order** —
+the same contract as `umap-learn`'s parallel mode. The model remembers the count, so
+`transform` runs in the same pool as the fit (`transform_with_one_thread_is_reproducible_on_the_hnsw_path`);
+before that its index was built on the global pool and `threads(1)` was not what it claimed.
 
 ## Parity
 

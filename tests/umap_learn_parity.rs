@@ -193,6 +193,7 @@ fn model_from_fixtures() -> umaprs::UmapModel {
         negative_sample_rate: 5.0,
         repulsion_strength: 1.0,
         transform_seed: 42,
+        threads: 0,
     }
 }
 
@@ -321,5 +322,24 @@ fn fit_with_one_thread_is_reproducible_on_the_hnsw_path() {
             .fit_transform(&data)
     };
     let (a, b) = (run(), run());
+    assert_eq!(a.as_slice().unwrap(), b.as_slice().unwrap());
+}
+
+/// The model carries the thread count, so `transform` at `threads(1)` is bit-for-bit too —
+/// its kNN index over the training set is built in the same sequential pool.
+#[test]
+fn transform_with_one_thread_is_reproducible_on_the_hnsw_path() {
+    use rand::{Rng, SeedableRng};
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(5);
+    let train = ndarray::Array2::from_shape_fn((3000, 24), |_| rng.gen_range(-1.0f64..1.0));
+    let new = ndarray::Array2::from_shape_fn((1000, 24), |_| rng.gen_range(-1.0f64..1.0));
+    let (_, model) = umaprs::UMAP::new()
+        .n_neighbors(15)
+        .n_epochs(20)
+        .random_state(11)
+        .threads(1)
+        .fit(&train);
+    assert_eq!(model.threads, 1);
+    let (a, b) = (model.transform(&new), model.transform(&new));
     assert_eq!(a.as_slice().unwrap(), b.as_slice().unwrap());
 }

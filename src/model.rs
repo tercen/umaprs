@@ -55,6 +55,8 @@ pub struct UmapModel {
     pub repulsion_strength: f64,
     /// Seed for the transform's negative sampling. `umap-learn`'s `transform_seed`, default 42.
     pub transform_seed: u64,
+    /// Thread count the model was fitted with; `transform` uses the same (0 = global pool).
+    pub threads: usize,
 }
 
 /// The transform's intermediate stages, exposed so each can be checked against `umap-learn`.
@@ -125,6 +127,10 @@ impl UmapModel {
     /// is written for rows whose column 0 is self. That is a quirk of the reference, copied so
     /// the projection is the one `umap-learn` users see.
     pub fn transform_stages(&self, new_data: &Array2<f64>) -> TransformStages {
+        crate::in_pool(self.threads, || self.transform_stages_inner(new_data))
+    }
+
+    fn transform_stages_inner(&self, new_data: &Array2<f64>) -> TransformStages {
         let expected_dims = self.training_data.ncols();
         if new_data.ncols() != expected_dims {
             let feat_info = match &self.feature_names {
@@ -196,7 +202,11 @@ impl UmapModel {
     /// `transform_seed` and the point's index, and is therefore deterministic at any thread
     /// count.
     pub fn transform(&self, new_data: &Array2<f64>) -> Array2<f64> {
-        let st = self.transform_stages(new_data);
+        crate::in_pool(self.threads, || self.transform_inner(new_data))
+    }
+
+    fn transform_inner(&self, new_data: &Array2<f64>) -> Array2<f64> {
+        let st = self.transform_stages_inner(new_data);
         let n_new = new_data.nrows();
         let n_train = self.training_data.nrows();
         let k = self.n_neighbors.min(n_train);
@@ -442,6 +452,7 @@ impl UmapModel {
             negative_sample_rate: 5.0,
             repulsion_strength: 1.0,
             transform_seed: 42,
+            threads: 0,
         }
     }
 }
@@ -467,6 +478,7 @@ mod tests {
             negative_sample_rate: 5.0,
             repulsion_strength: 1.0,
             transform_seed: 42,
+            threads: 0,
         };
 
         let path = "/tmp/umap_test_model.csv";
@@ -508,6 +520,7 @@ mod tests {
             negative_sample_rate: 5.0,
             repulsion_strength: 1.0,
             transform_seed: 42,
+            threads: 0,
         };
 
         let result = std::panic::catch_unwind(|| {

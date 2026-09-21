@@ -95,6 +95,20 @@ pub struct UMAP {
     pub sampling: SamplingStrategy,
 }
 
+/// Run `f` on a rayon pool of `threads` workers; 0 means the global pool. The fit and the
+/// model's `transform` both go through this, so `threads = 1` is sequential end to end.
+pub(crate) fn in_pool<T: Send>(threads: usize, f: impl FnOnce() -> T + Send) -> T {
+    if threads == 0 {
+        f()
+    } else {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("rayon pool")
+            .install(f)
+    }
+}
+
 impl Default for UMAP {
     fn default() -> Self {
         UMAP {
@@ -402,15 +416,7 @@ impl UMAP {
     }
 
     fn in_pool<T: Send>(&self, f: impl FnOnce() -> T + Send) -> T {
-        if self.threads == 0 {
-            f()
-        } else {
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(self.threads)
-                .build()
-                .expect("rayon pool")
-                .install(f)
-        }
+        in_pool(self.threads, f)
     }
 
     fn fit_inner(&self, data: &Array2<f64>) -> (Array2<f64>, UmapModel) {
@@ -494,6 +500,7 @@ impl UMAP {
             negative_sample_rate: self.negative_sample_rate,
             repulsion_strength: self.repulsion_strength,
             transform_seed: self.random_state.unwrap_or(42),
+            threads: self.threads,
         };
 
         (embedding, Some(model))
