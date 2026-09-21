@@ -84,6 +84,13 @@ pub struct UMAP {
     /// Fraction of data to use for training (default: None = use all).
     /// When set (e.g., 0.1), fit on a random subset and transform the rest.
     pub train_size: Option<f64>,
+    /// Threads for the kNN, the fuzzy set, the SGD and the transform. `0` (the default) is
+    /// rayon's own choice, which honours the container's CPU quota. Every stage is either
+    /// deterministic by construction or seeded per unit of work, except the fit's HogWild SGD,
+    /// whose float summation order varies with the thread count: `threads = 1` is
+    /// bit-repeatable, any other value is repeatable up to that order -- the same contract as
+    /// umap-learn's parallel mode.
+    pub threads: usize,
     /// Sampling strategy for training subset (default: Random)
     pub sampling: SamplingStrategy,
 }
@@ -107,6 +114,7 @@ impl Default for UMAP {
             model_format: ModelFormat::None,
             feature_names: None,
             train_size: None,
+            threads: 0,
             sampling: SamplingStrategy::Random,
         }
     }
@@ -221,10 +229,10 @@ impl UMAP {
         // `n_neighbors` counts the point itself, as in umap-learn: ask for k - 1 others.
         let k = self.n_neighbors.saturating_sub(1).max(1);
         match &self.knn_method {
-            KnnMethod::Auto => compute_knn_graph(data, k),
+            KnnMethod::Auto => compute_knn_graph(data, k, self.random_state.unwrap_or(42)),
             KnnMethod::BruteForce => compute_knn_bruteforce(data, k),
             KnnMethod::KdTree => knn::compute_knn_kdtree(data, k),
-            KnnMethod::Hnsw => compute_knn_hnsw_f32(data, k),
+            KnnMethod::Hnsw => compute_knn_hnsw_f32(data, k, self.random_state.unwrap_or(42)),
             KnnMethod::Gpu => gpu::compute_knn_gpu(data, k),
         }
     }
@@ -232,6 +240,10 @@ impl UMAP {
     /// Fit and return embedding only.
     /// If `train_size` is set, fits on a subset and transforms the rest.
     pub fn fit_transform(&self, data: &Array2<f64>) -> Array2<f64> {
+        self.in_pool(|| self.fit_transform_inner(data))
+    }
+
+    fn fit_transform_inner(&self, data: &Array2<f64>) -> Array2<f64> {
         let mut reduced = None;
         let work_data = self.prepare_data(data, &mut reduced);
 
@@ -378,6 +390,22 @@ impl UMAP {
 
     /// Fit and return both embedding and model (for transform)
     pub fn fit(&self, data: &Array2<f64>) -> (Array2<f64>, UmapModel) {
+        self.in_pool(|| self.fit_inner(data))
+    }
+
+    fn in_pool<T: Send>(&self, f: impl FnOnce() -> T + Send) -> T {
+        if self.threads == 0 {
+            f()
+        } else {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(self.threads)
+                .build()
+                .expect("rayon pool")
+                .install(f)
+        }
+    }
+
+    fn fit_inner(&self, data: &Array2<f64>) -> (Array2<f64>, UmapModel) {
         let mut reduced = None;
         let work_data = self.prepare_data(data, &mut reduced);
         let knn_indices = self.compute_knn(work_data);

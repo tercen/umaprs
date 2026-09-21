@@ -1,15 +1,14 @@
-/target
-/.cargo
-/.idea
 
-# Large data files (download separately)
-data/*.fcs
+/.cargo
+data/aml/
+data/bench_*.csv
 data/cyto_*.csv
 data/digits_*.csv
-data/pendigits_*.csv
+data/*.fcs
 data/highd_*.csv
-data/bench_*.csv
-
-# Results are regenerated
+data/pendigits_*.csv
+/.idea
+# Large data files (download separately)
 results/
-data/aml/
+# Results are regenerated
+/target

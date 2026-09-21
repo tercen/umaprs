@@ -40,7 +40,7 @@ fn main() {
 
     // Standard t-SNE
     let t = Instant::now();
-    let knn = compute_knn_graph(&data, k);
+    let knn = compute_knn_graph(&data, k, 42);
     let emb = tsne::run_tsne(&data, &knn, perplexity, 1000, 200.0, Some(42));
     println!("t-SNE standard:     {:.3}s", t.elapsed().as_secs_f64());
     save(&emb, "results/tsne_standard.csv");

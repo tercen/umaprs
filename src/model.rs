@@ -143,7 +143,7 @@ impl UmapModel {
         let n_components = self.embedding.ncols();
 
         let (knn_indices, knn_dists) =
-            crate::knn::compute_knn_external(&self.training_data, new_data, k);
+            crate::knn::compute_knn_external(&self.training_data, new_data, k, self.transform_seed);
         let dists_flat: Vec<f64> = knn_dists.iter().copied().collect();
         let inds_flat: Vec<usize> = knn_indices.iter().copied().collect();
         let (sigmas, rhos) = crate::fuzzy::smooth_knn_dist(&dists_flat, n_new, k, 0.0);
@@ -462,6 +462,11 @@ mod tests {
             b: 0.8951,
             n_neighbors: 15,
             feature_names: Some(vec!["x".into(), "y".into()]),
+            n_epochs: 0,
+            learning_rate: 1.0,
+            negative_sample_rate: 5.0,
+            repulsion_strength: 1.0,
+            transform_seed: 42,
         };
 
         let path = "/tmp/umap_test_model.csv";
@@ -498,6 +503,11 @@ mod tests {
             b: 0.8951,
             n_neighbors: 3,
             feature_names: Some(vec!["a".into(), "b".into(), "c".into()]),
+            n_epochs: 0,
+            learning_rate: 1.0,
+            negative_sample_rate: 5.0,
+            repulsion_strength: 1.0,
+            transform_seed: 42,
         };
 
         let result = std::panic::catch_unwind(|| {

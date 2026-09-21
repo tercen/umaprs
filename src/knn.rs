@@ -8,14 +8,17 @@ use crate::kdtree::KdTree;
 const TREE_THRESHOLD: usize = 500;
 
 /// Max dimensions for kd-tree (above this, HNSW is better)
-const KDTREE_MAX_DIMS: usize = 40;
+/// kd-trees stop pruning usefully somewhere around 15-20 dimensions; measured here at 40 dims
+/// a query cost 1.4 ms -- close to a full scan -- and the transform of 100k points took 139 s
+/// of which the SGD was 0.3 s. Above this, HNSW with an exact 2k refine.
+const KDTREE_MAX_DIMS: usize = 16;
 
 /// Compute k-nearest neighbors for each point.
 /// Strategy:
 ///   - Small datasets (<=500): exact brute-force
 ///   - Large + low-dim (<=40): kd-tree (exact, like uwot's FNN)
 ///   - Large + high-dim (>40): HNSW (approximate)
-pub fn compute_knn_graph(data: &Array2<f64>, k: usize) -> Array2<usize> {
+pub fn compute_knn_graph(data: &Array2<f64>, k: usize, seed: u64) -> Array2<usize> {
     let n_samples = data.nrows();
     let n_dims = data.ncols();
 
@@ -32,7 +35,7 @@ pub fn compute_knn_graph(data: &Array2<f64>, k: usize) -> Array2<usize> {
             "Using HNSW approximate nearest neighbors ({} points, {} dims)",
             n_samples, n_dims
         );
-        compute_knn_hnsw_f32(data, k)
+        compute_knn_hnsw_f32(data, k, seed)
     }
 }
 
@@ -84,7 +87,7 @@ pub fn compute_knn_kdtree(data: &Array2<f64>, k: usize) -> Array2<usize> {
 }
 
 /// Plain HNSW with f32 distances (no quantization)
-pub fn compute_knn_hnsw_f32(data: &Array2<f64>, k: usize) -> Array2<usize> {
+pub fn compute_knn_hnsw_f32(data: &Array2<f64>, k: usize, seed: u64) -> Array2<usize> {
     let n_samples = data.nrows();
     let n_dims = data.ncols();
 
@@ -102,7 +105,7 @@ pub fn compute_knn_hnsw_f32(data: &Array2<f64>, k: usize) -> Array2<usize> {
         sum // squared distance — sqrt not needed for ordering
     };
 
-    let hnsw = Hnsw::build(n_samples, &dist_fn, 42);
+    let hnsw = Hnsw::build(n_samples, &dist_fn, seed);
 
     // Get 2k candidates from HNSW, refine with exact f64 distances
     let refine_k = (k * 2).min(n_samples - 1);
@@ -180,6 +183,7 @@ pub fn compute_knn_external(
     train: &Array2<f64>,
     queries: &Array2<f64>,
     k: usize,
+    seed: u64,
 ) -> (Array2<usize>, Array2<f64>) {
     let (n_train, d) = (train.nrows(), train.ncols());
     let n_q = queries.nrows();
@@ -247,7 +251,7 @@ pub fn compute_knn_external(
             let b = &flat_ref[j as usize * d..(j as usize + 1) * d];
             a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum::<f32>()
         };
-        let hnsw = Hnsw::build(n_train, &dist_fn, 42);
+        let hnsw = Hnsw::build(n_train, &dist_fn, seed);
         let refine_k = (k * 2).min(n_train);
         inds.outer_iter_mut()
             .zip(dists.outer_iter_mut())
