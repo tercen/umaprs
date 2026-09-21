@@ -147,3 +147,17 @@ G = (A + T - P).tocoo(); G.eliminate_zeros()
 o = np.lexsort((G.col, G.row))
 save("graph_f64", np.c_[G.row[o], G.col[o], G.data[o]], fmt=["%d", "%d", "%.17g"])
 print("float64 references written")
+
+# --- transform stages in float64, same transcription -----------------------------------------
+t_sig64, t_rho64 = smooth_knn_dist_f64(t_dists, float(K), local_connectivity=0.0)
+save("t_sigmas_rhos_f64", np.c_[t_sig64, t_rho64])
+tr, tc, tv = memberships_f64(t_inds, t_dists, t_sig64, t_rho64, bipartite=True)
+save("t_memberships_f64", np.c_[tr, tc, tv], fmt=["%d", "%d", "%.17g"])
+# weighted mean of neighbour embeddings, weights l1-normalised per query (init_graph_transform)
+emb64 = emb.astype(np.float64)
+init64 = np.zeros((n_test, 2))
+for i in range(n_test):
+    w = tv[i * K:(i + 1) * K]; nb = tc[i * K:(i + 1) * K]
+    init64[i] = (w[:, None] * emb64[nb]).sum(0) / w.sum()
+save("t_init_f64", init64)
+print("float64 transform references written")

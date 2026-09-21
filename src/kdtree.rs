@@ -36,6 +36,16 @@ impl KdTree {
         }
     }
 
+    /// k nearest points to an arbitrary vector (a point *not* in the tree, so nothing is
+    /// excluded). Returns (index, squared distance) sorted ascending, as `knn` does.
+    pub fn query(&self, q: &[f32], k: usize) -> Vec<(u32, f32)> {
+        let mut best: Vec<(u32, f32)> = Vec::with_capacity(k + 1);
+        self.search_recursive(1, q, u32::MAX, k, &mut best);
+        best.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        best.truncate(k);
+        best
+    }
+
     /// Find k nearest neighbors of point q. Returns (index, distance) pairs sorted by distance.
     pub fn knn(&self, q_idx: usize, k: usize) -> Vec<(u32, f32)> {
         let mut best: Vec<(u32, f32)> = Vec::with_capacity(k + 1);

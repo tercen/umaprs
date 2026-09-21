@@ -169,3 +169,119 @@ mod tests {
         assert_eq!(knn[[3, 0]], 4);
     }
 }
+
+/// k nearest *training* points for each query row — the transform's kNN.
+///
+/// Exact kd-tree up to `KDTREE_MAX_DIMS`; above that HNSW with a 2k exact refine, as the fit
+/// does. The queries are not in the index, so nothing is excluded and no self row is added:
+/// this is what `umap-learn`'s `_knn_search_index.query` returns. Distances are exact f64.
+/// Parallel over queries.
+pub fn compute_knn_external(
+    train: &Array2<f64>,
+    queries: &Array2<f64>,
+    k: usize,
+) -> (Array2<usize>, Array2<f64>) {
+    let (n_train, d) = (train.nrows(), train.ncols());
+    let n_q = queries.nrows();
+    assert_eq!(
+        queries.ncols(),
+        d,
+        "query dimensionality must match the training data"
+    );
+    let k = k.min(n_train);
+    let flat: Vec<f32> = train.iter().map(|&v| v as f32).collect();
+    let mut inds = Array2::zeros((n_q, k));
+    let mut dists = Array2::zeros((n_q, k));
+
+    let exact = |qi: usize, cands: &[u32], out_i: &mut [usize], out_d: &mut [f64]| {
+        let q = queries.row(qi);
+        let mut ex: Vec<(usize, f64)> = cands
+            .iter()
+            .map(|&j| (j as usize, euclidean_distance(q, train.row(j as usize))))
+            .collect();
+        ex.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap().then(a.0.cmp(&b.0)));
+        for (slot, &(j, dd)) in ex.iter().take(k).enumerate() {
+            out_i[slot] = j;
+            out_d[slot] = dd;
+        }
+    };
+
+    if n_train <= TREE_THRESHOLD {
+        inds.outer_iter_mut()
+            .zip(dists.outer_iter_mut())
+            .enumerate()
+            .par_bridge()
+            .for_each(|(qi, (mut ri, mut rd))| {
+                let all: Vec<u32> = (0..n_train as u32).collect();
+                exact(
+                    qi,
+                    &all,
+                    ri.as_slice_mut().unwrap(),
+                    rd.as_slice_mut().unwrap(),
+                );
+            });
+    } else if d <= KDTREE_MAX_DIMS {
+        let tree = KdTree::build(&flat, n_train, d);
+        inds.outer_iter_mut()
+            .zip(dists.outer_iter_mut())
+            .enumerate()
+            .par_bridge()
+            .for_each(|(qi, (mut ri, mut rd))| {
+                let q: Vec<f32> = queries.row(qi).iter().map(|&v| v as f32).collect();
+                let cands: Vec<u32> = tree
+                    .query(&q, k.min(n_train))
+                    .into_iter()
+                    .map(|(i, _)| i)
+                    .collect();
+                exact(
+                    qi,
+                    &cands,
+                    ri.as_slice_mut().unwrap(),
+                    rd.as_slice_mut().unwrap(),
+                );
+            });
+    } else {
+        let flat_ref = &flat;
+        let dist_fn = |i: u32, j: u32| -> f32 {
+            let a = &flat_ref[i as usize * d..(i as usize + 1) * d];
+            let b = &flat_ref[j as usize * d..(j as usize + 1) * d];
+            a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum::<f32>()
+        };
+        let hnsw = Hnsw::build(n_train, &dist_fn, 42);
+        let refine_k = (k * 2).min(n_train);
+        inds.outer_iter_mut()
+            .zip(dists.outer_iter_mut())
+            .enumerate()
+            .par_bridge()
+            .for_each(|(qi, (mut ri, mut rd))| {
+                let q: Vec<f32> = queries.row(qi).iter().map(|&v| v as f32).collect();
+                // A query that is not in the graph is addressed as a virtual id: the search only
+                // ever asks for the distance from a graph node to the target, so the closure
+                // answers with the query vector when it sees that id.
+                let virt = n_train as u32;
+                let qdist = |i: u32, j: u32| -> f32 {
+                    if j == virt {
+                        let a = &flat_ref[i as usize * d..(i as usize + 1) * d];
+                        a.iter()
+                            .zip(&q)
+                            .map(|(x, y)| (x - y) * (x - y))
+                            .sum::<f32>()
+                    } else {
+                        dist_fn(i, j)
+                    }
+                };
+                let cands: Vec<u32> = hnsw
+                    .search(virt, refine_k, &qdist)
+                    .into_iter()
+                    .map(|(i, _)| i)
+                    .collect();
+                exact(
+                    qi,
+                    &cands,
+                    ri.as_slice_mut().unwrap(),
+                    rd.as_slice_mut().unwrap(),
+                );
+            });
+    }
+    (inds, dists)
+}

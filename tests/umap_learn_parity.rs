@@ -171,3 +171,136 @@ fn ab_params_match_find_ab_params() {
         assert_close(gb, b, 1e-4, &format!("b at min_dist {md} spread {sp}"));
     }
 }
+
+// ---- the transform, stage by stage ---------------------------------------------------------------
+
+fn model_from_fixtures() -> umaprs::UmapModel {
+    let train = fixture("train");
+    let (n, d) = (train.len(), train[0].len());
+    let emb = fixture("train_embedding");
+    let (a, b) = umaprs::find_ab_params(0.1, 1.0); // the fixture embedding was fit at min_dist 0.1
+    umaprs::UmapModel {
+        training_data: ndarray::Array2::from_shape_vec((n, d), flat(&train)).unwrap(),
+        embedding: ndarray::Array2::from_shape_vec((n, 2), flat(&emb)).unwrap(),
+        sigmas: vec![0.0; n],
+        rhos: vec![0.0; n],
+        a,
+        b,
+        n_neighbors: K,
+        feature_names: None,
+        n_epochs: 0,
+        learning_rate: 1.0,
+        negative_sample_rate: 5.0,
+        repulsion_strength: 1.0,
+        transform_seed: 42,
+    }
+}
+
+fn test_points() -> ndarray::Array2<f64> {
+    let t = fixture("test");
+    ndarray::Array2::from_shape_vec((t.len(), t[0].len()), flat(&t)).unwrap()
+}
+
+#[test]
+fn transform_knn_against_the_training_set_is_exact() {
+    let st = model_from_fixtures().transform_stages(&test_points());
+    let want_i = fixture("t_knn_indices");
+    let want_d = fixture("t_knn_dists");
+    for i in 0..want_i.len() {
+        for j in 0..K {
+            assert_eq!(
+                st.knn_indices[[i, j]],
+                want_i[i][j] as usize,
+                "query {i} neighbour {j}"
+            );
+            assert_close(
+                st.knn_dists[[i, j]],
+                want_d[i][j],
+                1e-12,
+                &format!("query {i} distance {j}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn transform_sigmas_use_local_connectivity_zero_so_rho_is_zero() {
+    let st = model_from_fixtures().transform_stages(&test_points());
+    let want64 = fixture("t_sigmas_rhos_f64");
+    let want32 = fixture("t_sigmas_rhos");
+    for i in 0..want64.len() {
+        assert_eq!(
+            st.rhos[i], 0.0,
+            "rho[{i}] is zero for a query, by umap-learn's convention"
+        );
+        assert_close(
+            st.sigmas[i],
+            want64[i][0],
+            1e-12,
+            &format!("sigma[{i}] f64"),
+        );
+        assert_close(st.sigmas[i], want32[i][0], 1e-4, &format!("sigma[{i}] f32"));
+    }
+}
+
+#[test]
+fn transform_memberships_and_init_match_umap_learn() {
+    let st = model_from_fixtures().transform_stages(&test_points());
+    let m64 = fixture("t_memberships_f64");
+    for (e, w) in m64.iter().enumerate() {
+        assert_close(st.memberships[e], w[2], 1e-12, &format!("membership {e}"));
+    }
+    let init64 = fixture("t_init_f64");
+    let init32 = fixture("t_init");
+    for i in 0..init64.len() {
+        for c in 0..2 {
+            assert_close(
+                st.init[[i, c]],
+                init64[i][c],
+                1e-12,
+                &format!("init[{i},{c}] f64"),
+            );
+            assert_close(
+                st.init[[i, c]],
+                init32[i][c],
+                1e-4,
+                &format!("init[{i},{c}] f32"),
+            );
+        }
+    }
+}
+
+#[test]
+fn transform_is_deterministic_at_any_thread_count_and_stays_near_its_init() {
+    let model = model_from_fixtures();
+    let x = test_points();
+    let a = model.transform(&x);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    let b = pool.install(|| model.transform(&x));
+    let st = model.transform_stages(&x);
+    let mut moved = 0.0;
+    for i in 0..x.nrows() {
+        for c in 0..2 {
+            assert_eq!(
+                a[[i, c]].to_bits(),
+                b[[i, c]].to_bits(),
+                "point {i} differs across thread counts"
+            );
+            assert!(a[[i, c]].is_finite());
+            moved += (a[[i, c]] - st.init[[i, c]]).abs();
+        }
+    }
+    let span = model
+        .embedding
+        .iter()
+        .cloned()
+        .fold(0.0f64, |m, v| m.max(v.abs()));
+    let mean_move = moved / (2.0 * x.nrows() as f64);
+    assert!(
+        mean_move < 0.5 * span,
+        "projected points wandered {mean_move:.3} against a map spanning {span:.3}"
+    );
+}

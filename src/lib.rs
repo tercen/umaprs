@@ -16,7 +16,9 @@ mod spectral;
 pub mod tsne;
 
 pub use fuzzy::compute_fuzzy_simplicial_set;
+pub use knn::compute_knn_external;
 pub use knn::{compute_knn_bruteforce, compute_knn_graph, compute_knn_hnsw_f32};
+pub use model::TransformStages;
 pub use model::{SamplingStrategy, UmapModel};
 pub use optimize::optimize_layout;
 /// `umap-learn`'s curve fit for `a`, `b`; exposed so the fit can be checked against it.
@@ -451,6 +453,11 @@ impl UMAP {
             b,
             n_neighbors: self.n_neighbors,
             feature_names: self.feature_names.clone(),
+            n_epochs: self.n_epochs,
+            learning_rate: self.learning_rate,
+            negative_sample_rate: self.negative_sample_rate,
+            repulsion_strength: self.repulsion_strength,
+            transform_seed: self.random_state.unwrap_or(42),
         };
 
         (embedding, Some(model))
