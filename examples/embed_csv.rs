@@ -1,6 +1,6 @@
 //! Embed a CSV at three seeds for scripts/envelope.py:
 //!
-//!     cargo run --release --example embed_csv -- <name> <data.csv> [min_dist]
+//!     cargo run --release --example embed_csv -- <name> <data.csv> [min_dist] [knn=auto|brute|kdtree|hnsw]
 //!
 //! Writes results/env_<name>_umaprs_seed{1,2,3}.csv and a timings file. Same settings as the
 //! umap-learn and uwot runs the scorer compares against: n_neighbors 15, n_epochs 200.
@@ -28,6 +28,16 @@ fn main() {
     let a: Vec<String> = std::env::args().collect();
     let (name, path) = (&a[1], &a[2]);
     let md: f64 = a.get(3).and_then(|v| v.parse().ok()).unwrap_or(0.01);
+    let knn = a
+        .get(4)
+        .map(|v| v.trim_start_matches("knn=").to_string())
+        .unwrap_or("auto".into());
+    let (method, engine) = match knn.as_str() {
+        "brute" => (umaprs::KnnMethod::BruteForce, "umaprs-brute"),
+        "kdtree" => (umaprs::KnnMethod::KdTree, "umaprs-kdtree"),
+        "hnsw" => (umaprs::KnnMethod::Hnsw, "umaprs-hnsw"),
+        _ => (umaprs::KnnMethod::Auto, "umaprs"),
+    };
     let data = read_csv(path);
     std::fs::create_dir_all("results").unwrap();
     let mut secs = Vec::new();
@@ -38,16 +48,17 @@ fn main() {
             .min_dist(md)
             .n_epochs(200)
             .random_state(seed)
+            .knn_method(method.clone())
             .fit_transform(&data);
         secs.push(t.elapsed().as_secs_f64());
         let mut f =
-            std::fs::File::create(format!("results/env_{name}_umaprs_seed{seed}.csv")).unwrap();
+            std::fs::File::create(format!("results/env_{name}_{engine}_seed{seed}.csv")).unwrap();
         for i in 0..emb.nrows() {
             writeln!(f, "{:.8e},{:.8e}", emb[[i, 0]], emb[[i, 1]]).unwrap();
         }
     }
     std::fs::write(
-        format!("results/env_{name}_umaprs_timings.json"),
+        format!("results/env_{name}_{engine}_timings.json"),
         format!(
             "[{}]",
             secs.iter()
@@ -57,5 +68,5 @@ fn main() {
         ),
     )
     .unwrap();
-    eprintln!("umaprs {name}: {:?} s", secs);
+    eprintln!("{engine} {name}: {:?} s", secs);
 }

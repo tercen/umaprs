@@ -36,7 +36,7 @@ transcendental; no bounded fast path was needed.
 (`examples/time_transform_stages.rs`): kNN + σ + init **139.4 s**, SGD **0.3 s**. At 40 dims a
 kd-tree barely prunes — 1.4 ms a query is close to a full scan — and the fit's kNN pays the same
 price. The cutoff moved to 16 dims; above it HNSW with an exact 2k refine.
-Same measurement on the HNSW path: TODO_HNSW.
+Same measurement on the HNSW path: kNN + σ + init **16.6 s**, SGD **2.6 s**, whole transform **19.2 s** — seven times faster, and the fit's kNN gains the same way. At Jamie's 1.2M queries against 465k training cells that is minutes, not the hour the brute-force scan needed.
 
 **Before the index existed**, transforming 400k against 100k took 547 s — and would have been an
 hour at Jamie's 1.2M × 465k.
@@ -53,7 +53,23 @@ subsample. The first synthetic set (well-separated blobs) was useless for this: 
 stability 0.013, because inside a homogeneous blob the 2-D neighbours are arbitrary between
 seeds. The set now has twelve overlapping populations with sizes varying 20×.
 
-TODO_ENVELOPE
+**AML 1% (50,500 cells × 38 markers, real cytometry, two labels), `n_neighbors` 15, `min_dist` 0.01,
+200 epochs, three seeds, metrics on a 10,000-cell subsample:**
+
+| engine | seconds / fit | purity | trustworthiness | stability (Jaccard, k=15) | Procrustes agreement |
+|---|---|---|---|---|---|
+| `umap-learn 0.5.12` | 41.2 | 0.9841 ± 0.0001 | 0.9680 ± 0.0005 | 0.404 | 0.989 |
+| **`umaprs` (this branch)** | **14.2** | 0.9840 ± 0.0001 | 0.9645 ± 0.0006 | 0.394 | 0.968 |
+| `uwot 0.2.5` | 29.6 | 0.9841 ± 0.0002 | 0.9676 ± 0.0004 | 0.364 | 0.987 |
+
+On real data the branch is inside both references' envelope on purity, trustworthiness and
+seed-to-seed neighbour stability, at a third of `umap-learn`'s time and half of `uwot`'s. Its
+Procrustes agreement between seeds is a little lower (0.968 against 0.989 / 0.987): the layout
+moves more between seeds, consistent with an approximate kNN graph that varies with the seed
+where the references' varies less.
+
+TODO_SYNTHETIC
+
 
 ## Left as it was, on purpose
 

@@ -10,7 +10,10 @@ metrics the Lyme sweep used:
 
   purity        fraction of a cell's 15 nearest 2-D neighbours sharing its label (needs labels)
   trust         sklearn trustworthiness, k = 15
-  stability     mean Jaccard overlap of 15-NN sets between seeds of the same engine
+  stability     mean Jaccard overlap of 15-NN sets between seeds of the same engine -- floors
+                near 0 on homogeneous populations (any 15 of thousands of equidistant cells), so
+  procrustes    is reported too: 1 - Procrustes disparity between seeds after the optimal
+                rotation/reflection/scale, i.e. how much of the layout is the same map at all
 
 trust and stability are computed on a fixed 10,000-cell subsample so the score is affordable.
 A synthetic dataset is available as `<data.csv>` = "synthetic": 50,000 cells x 32 markers in 12
@@ -57,6 +60,15 @@ def score(E):
     s["trust"] = float(trustworthiness(X[sub], E[sub], n_neighbors=K))
     return s
 
+def procrustes_agreement(embs):
+    from scipy.spatial import procrustes
+    v = []
+    for a in range(len(embs)):
+        for b in range(a + 1, len(embs)):
+            _, _, disparity = procrustes(embs[a][sub], embs[b][sub])
+            v.append(1.0 - disparity)
+    return float(np.mean(v)) if v else float("nan")
+
 def stability(embs):
     sets = [[set(r) for r in knn_sets(E)] for E in embs]
     j = []
@@ -67,16 +79,25 @@ def stability(embs):
 
 engines = {}
 # umap-learn, run here
-import umap
-embs, secs = [], []
-for s in SEEDS:
-    t = time.time()
-    E = umap.UMAP(n_neighbors=K, min_dist=md, n_epochs=200, random_state=s).fit_transform(X)
-    secs.append(time.time() - t); embs.append(E.astype(np.float64))
-    np.savetxt(f"{OUT}/env_{name}_umap-learn_seed{s}.csv", E, delimiter=",", fmt="%.8g")
+ul_files = [f"{OUT}/env_{name}_umap-learn_seed{s}.csv" for s in SEEDS]
+ul_timing = f"{OUT}/env_{name}_umap-learn_timings.json"
+if all(os.path.exists(f) for f in ul_files) and os.path.exists(ul_timing):
+    embs = [np.loadtxt(f, delimiter=",") for f in ul_files]; secs = json.load(open(ul_timing))
+else:
+    import umap
+    embs, secs = [], []
+    for s in SEEDS:
+        t = time.time()
+        E = umap.UMAP(n_neighbors=K, min_dist=md, n_epochs=200, random_state=s).fit_transform(X)
+        secs.append(time.time() - t); embs.append(E.astype(np.float64))
+        np.savetxt(f"{OUT}/env_{name}_umap-learn_seed{s}.csv", E, delimiter=",", fmt="%.8g")
+    json.dump(secs, open(ul_timing, "w"))
 engines["umap-learn 0.5.12"] = (embs, secs)
 # other engines, from files
-for eng in ("umaprs", "uwot"):
+import glob, re
+found = sorted({re.sub(r".*/env_%s_(.+)_seed1\.csv$" % re.escape(name), r"\1", f)
+                for f in glob.glob(f"{OUT}/env_{name}_*_seed1.csv")} - {"umap-learn"})
+for eng in found:
     files = [f"{OUT}/env_{name}_{eng}_seed{s}.csv" for s in SEEDS]
     if all(os.path.exists(f) for f in files):
         embs = [np.loadtxt(f, delimiter=",") for f in files]
@@ -89,11 +110,12 @@ for eng, (embs, secs) in engines.items():
     sc = [score(E) for E in embs]
     row = {"engine": eng, "seconds": f"{np.mean(secs):.1f}",
            "stability": f"{stability(embs):.3f}",
+           "procrustes": f"{procrustes_agreement(embs):.3f}",
            "trust": f"{np.mean([c['trust'] for c in sc]):.4f} ± {np.std([c['trust'] for c in sc]):.4f}"}
     if labels is not None:
         row["purity"] = f"{np.mean([c['purity'] for c in sc]):.4f} ± {np.std([c['purity'] for c in sc]):.4f}"
     rows.append(row)
-cols = ["engine", "seconds", "purity", "trust", "stability"] if labels is not None else ["engine", "seconds", "trust", "stability"]
+cols = ["engine", "seconds", "purity", "trust", "stability", "procrustes"] if labels is not None else ["engine", "seconds", "trust", "stability", "procrustes"]
 print(f"\n### {name} — n = {n}, min_dist = {md}, k = {K}, seeds {SEEDS}, metrics on {len(sub)} cells\n")
 print("| " + " | ".join(cols) + " |"); print("|" + "---|" * len(cols))
 for r in rows: print("| " + " | ".join(r.get(c, "") for c in cols) + " |")

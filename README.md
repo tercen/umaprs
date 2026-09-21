@@ -2,17 +2,22 @@
 
 A fast Rust implementation of UMAP (Uniform Manifold Approximation and Projection) for dimensionality reduction.
 
-2-3x faster than R uwot with comparable or better quality on real datasets. Minimal dependencies, self-contained binary (~1.5 MB).
+UMAP as `umap-learn` defines it — every stage checked against `umap-learn 0.5.12` on the same kNN — with a transform that projects new points the way `umap-learn`'s does, seeded, and parallel. Minimal dependencies, self-contained binary (~1.5 MB). See **Parity** and **Envelope** below for what is measured, and `STATUS.md` for how.
 
 ## Performance
 
-Tested on the Levine CyTOF dataset (50,000 cells, 32 protein markers, 14 populations):
+Measured on the same deterministic 50k × 32 fit (`examples/time_fit.rs`), 16 cores:
 
-| | umaprs | R uwot |
+| | this branch | base commit |
 |---|---|---|
-| Time | **6.5s** | 15.2s |
-| Separation | **8.85** | 8.48 |
-| Quality | **104%** | 100% |
+| fit, 200 epochs | **8.86 s** | 10.01 s |
+
+The branch replaced an approximate `pow` (5.3% worst error) with an exact one *and* got faster,
+because the fuzzy set went from a serial `HashMap` to a parallel CSR merge. The transform of
+100k points against a 100k training set at 40 dims takes **19.2 s** on the HNSW path (kNN
+16.6 s, SGD 2.6 s); the same on the old kd-tree cutoff took 139.7 s, and the brute-force scan
+before that would have taken an hour at cohort scale. Reference engines on the same 50k × 32
+data, one fit: `umap-learn 0.5.12` 76.8 s, `uwot 0.2.5` (`n_sgd_threads = 0`) ~20 s.
 
 ## Usage
 
@@ -43,15 +48,16 @@ UMAP::new()
     .knn_method(KnnMethod::Auto) // Auto | KdTree | Hnsw | BruteForce | TurboQuant*
     .pca(50)                     // optional PCA dim reduction before kNN
     .train_size(0.1)             // fit on subset, transform rest (for large data)
-    .random_state(42)            // reproducibility seed
+    .random_state(42)            // seed: kNN (HNSW), init noise, SGD sampling, transform
+    .threads(0)                  // rayon pool size; 0 = rayon's choice (honours a CPU quota)
 ```
 
 ## kNN Methods
 
 | Method | Type | Best for |
 |---|---|---|
-| `KdTree` | Exact | dims <= 40 (default for this range) |
-| `Hnsw` | Approximate | dims > 40 |
+| `KdTree` | Exact | dims <= 16 (default for this range; at 40 dims a kd-tree barely prunes — measured, see `STATUS.md`) |
+| `Hnsw` | Approximate, seeded from `random_state`, 2k exact refine | dims > 16 (default) |
 | `BruteForce` | Exact | n <= 500 (default for this range) |
 | `TurboQuant4KdTree` | Approximate | Memory-constrained, high-dim (experimental) |
 | `TurboQuant8KdTree` | Approximate | Memory-constrained, moderate-dim (experimental) |
@@ -60,23 +66,44 @@ See [docs/turboquant.md](docs/turboquant.md) for details on TurboQuant methods.
 
 ## Fit / Transform
 
-For large datasets, fit on a subset and transform the rest:
-
 ```rust
-// Automatic: fit on 10%, transform remaining 90%
-let embedding = UMAP::new()
-    .train_size(0.1)
-    .fit_transform(&data);
-
-// Manual: get model for later use
-let (embedding, model) = UMAP::new()
-    .model_format(ModelFormat::Csv("model.csv".into()))
-    .fit(&data);
-
-// Transform new data with saved model
-let model = UmapModel::load_triples_csv("model.csv").unwrap();
-let new_embedding = model.transform(&new_data);
+let (embedding, model) = UMAP::new().n_neighbors(15).min_dist(0.01).random_state(42).fit(&train);
+let projected = model.transform(&rest);   // umap-learn's transform, not a placement
 ```
+
+`transform` is `umap-learn`'s, stage for stage: each new point's neighbours among the training
+points (kd-tree or HNSW — never a scan), its own σ with ρ = 0 (`local_connectivity − 1`, the
+reference's convention for a query), bipartite memberships, the membership-weighted mean of the
+neighbours' positions as the start, then negative-sampled SGD against the **fixed** training
+map at a quarter of the learning rate for 30 / 100 epochs (or a third of the fit's). Only the
+new point moves, so every point is independent: the loop is parallel with one seeded RNG per
+point (`model.transform_seed`, default 42 as upstream) and bit-identical at any thread count.
+
+`.train_size(f)` still fits on a random fraction and transforms the rest; a per-group draw
+(so many cells per sample) is the caller's to make with `fit` + `transform`.
+
+## Threads and reproducibility
+
+`.threads(n)` sizes the rayon pool for kNN, the fuzzy set, the SGD and the transform; `0` (the
+default) leaves rayon its choice, which honours a container's CPU quota. Every stage is
+deterministic by construction or seeded per unit of work except the fit's HogWild SGD, whose
+float summation order depends on the thread count: **`threads(1)` is bit-repeatable; any other
+count is repeatable up to that order** — the same contract as `umap-learn`'s parallel mode.
+
+## Parity
+
+`tests/umap_learn_parity.rs` holds each stage to `umap-learn 0.5.12` given the same kNN:
+σ and ρ, the memberships, the symmetric graph, `a`/`b`, and the transform's kNN, σ,
+memberships and initial positions. Two tolerances: **1e-12** against a line-for-line float64
+transcription of the reference's functions (the arithmetic is the same), **1e-4** against a real
+run (its stage functions are numba-compiled for float32). Fixtures are synthetic, written at
+17 significant digits by `fixtures/gen_umap_learn_fixtures.py`.
+
+## Envelope
+
+`scripts/envelope.py` compares engines at three seeds on the metrics the Lyme sweep used — kNN
+purity against labels, trustworthiness, seed-to-seed neighbour overlap. The table is in
+`STATUS.md`.
 
 ## Data Preprocessing
 
