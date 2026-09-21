@@ -88,6 +88,22 @@ pub fn compute_knn_kdtree(data: &Array2<f64>, k: usize) -> Array2<usize> {
 
 /// Plain HNSW with f32 distances (no quantization)
 pub fn compute_knn_hnsw_f32(data: &Array2<f64>, k: usize, seed: u64) -> Array2<usize> {
+    compute_knn_hnsw_tuned(data, k, seed, DEFAULT_EF_SEARCH, DEFAULT_REFINE)
+}
+
+/// HNSW beam width and the candidate multiple refined by exact distance. Chosen from
+/// `examples/knn_recall.rs`; see STATUS.md for the measurement.
+pub const DEFAULT_EF_SEARCH: usize = 100;
+pub const DEFAULT_REFINE: usize = 2;
+
+/// HNSW with explicit `ef_search` and refine multiple, for measurement and tuning.
+pub fn compute_knn_hnsw_tuned(
+    data: &Array2<f64>,
+    k: usize,
+    seed: u64,
+    ef_search: usize,
+    refine: usize,
+) -> Array2<usize> {
     let n_samples = data.nrows();
     let n_dims = data.ncols();
 
@@ -97,9 +113,21 @@ pub fn compute_knn_hnsw_f32(data: &Array2<f64>, k: usize, seed: u64) -> Array2<u
     let dist_fn = move |i: u32, j: u32| -> f32 {
         let a = i as usize * n_dims;
         let b = j as usize * n_dims;
-        let mut sum = 0.0f32;
-        for d in 0..n_dims {
-            let diff = unsafe { flat.get_unchecked(a + d) - flat.get_unchecked(b + d) };
+        // Four accumulators: a single f32 chain cannot be reordered by the compiler and
+        // serialises on the add latency.
+        let (x, y) = (&flat[a..a + n_dims], &flat[b..b + n_dims]);
+        let mut acc = [0.0f32; 4];
+        let (xc, yc) = (x.chunks_exact(4), y.chunks_exact(4));
+        let (xr, yr) = (xc.remainder(), yc.remainder());
+        for (p, q) in xc.zip(yc) {
+            for i in 0..4 {
+                let diff = p[i] - q[i];
+                acc[i] += diff * diff;
+            }
+        }
+        let mut sum = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+        for (p, q) in xr.iter().zip(yr) {
+            let diff = p - q;
             sum += diff * diff;
         }
         sum // squared distance — sqrt not needed for ordering
@@ -108,14 +136,14 @@ pub fn compute_knn_hnsw_f32(data: &Array2<f64>, k: usize, seed: u64) -> Array2<u
     let hnsw = Hnsw::build(n_samples, &dist_fn, seed);
 
     // Get 2k candidates from HNSW, refine with exact f64 distances
-    let refine_k = (k * 2).min(n_samples - 1);
+    let refine_k = (k * refine).min(n_samples - 1);
     let mut knn_indices = Array2::zeros((n_samples, k));
     knn_indices
         .outer_iter_mut()
         .enumerate()
         .par_bridge()
         .for_each(|(i, mut row)| {
-            let results = hnsw.search(i as u32, refine_k + 1, &dist_fn);
+            let results = hnsw.search_ef(i as u32, refine_k + 1, ef_search, &dist_fn);
 
             let candidates: Vec<usize> = results
                 .iter()

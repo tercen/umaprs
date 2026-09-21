@@ -16,7 +16,7 @@ mod spectral;
 pub mod tsne;
 
 pub use fuzzy::compute_fuzzy_simplicial_set;
-pub use knn::compute_knn_external;
+pub use knn::{DEFAULT_EF_SEARCH, DEFAULT_REFINE, compute_knn_external, compute_knn_hnsw_tuned};
 pub use knn::{compute_knn_bruteforce, compute_knn_graph, compute_knn_hnsw_f32};
 pub use model::TransformStages;
 pub use model::{SamplingStrategy, UmapModel};

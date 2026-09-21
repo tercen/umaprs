@@ -10,13 +10,14 @@ Measured on the same deterministic 50k × 32 fit (`examples/time_fit.rs`), 16 co
 
 | | this branch | base commit |
 |---|---|---|
-| fit, 200 epochs | **8.86 s** | 10.01 s |
+| fit, 200 epochs | **5.96 s** | 10.01 s |
 
-The branch replaced an approximate `pow` (5.3% worst error) with an exact one *and* got faster,
-because the fuzzy set went from a serial `HashMap` to a parallel CSR merge. The transform of
-100k points against a 100k training set at 40 dims takes **19.2 s** on the HNSW path (kNN
-16.6 s, SGD 2.6 s); the same on the old kd-tree cutoff took 139.7 s, and the brute-force scan
-before that would have taken an hour at cohort scale. Reference engines on the same 50k × 32
+The branch replaced an approximate `pow` (5.3% worst error) with an exact one *and* got faster:
+the fuzzy set went from a serial `HashMap` to a parallel CSR merge (8.86 s), then the HNSW index
+build went parallel (5.96 s). The transform of 100k points against a 100k training set at 40 dims
+takes **9.8 s** on the HNSW path (kNN + σ + init 7.8 s, SGD 2.0 s); the same on the old kd-tree
+cutoff took 139.7 s, and the brute-force scan before that would have taken an hour at cohort
+scale. Reference engines on the same 50k × 32
 data, one fit: `umap-learn 0.5.12` 76.8 s, `uwot 0.2.5` (`n_sgd_threads = 0`) ~20 s.
 
 ## Usage
@@ -101,7 +102,7 @@ run (its stage functions are numba-compiled for float32). Fixtures are synthetic
 
 ## Envelope
 
-`scripts/envelope.py` compares engines at three seeds on the metrics the Lyme sweep used — kNN
+`scripts/envelope.py` compares engines at three seeds on the metrics the cytometry parameter sweep used — kNN
 purity against labels, trustworthiness, seed-to-seed neighbour overlap. The table is in
 `STATUS.md`.
 
@@ -163,6 +164,9 @@ cargo run --release --example digits_compare
 - `rayon` — Parallelism
 
 No external kNN libraries. kd-tree, HNSW, and TurboQuant are implemented from scratch.
+The HNSW uses heuristic neighbour selection (Malkov & Yashunin, Alg. 4) and `EF_SEARCH = 100`
+with an exact 2k refine: recall@15 0.998 against brute force on 50k × 32 clustered data
+(`cargo run --release --example knn_recall -- <data.csv>` measures it).
 
 ## License
 
