@@ -114,13 +114,15 @@ pub fn compute_knn_hnsw_f32(data: &Array2<f64>, k: usize) -> Array2<usize> {
         .for_each(|(i, mut row)| {
             let results = hnsw.search(i as u32, refine_k + 1, &dist_fn);
 
-            let candidates: Vec<usize> = results.iter()
+            let candidates: Vec<usize> = results
+                .iter()
                 .map(|&(nb, _)| nb as usize)
                 .filter(|&j| j != i)
                 .collect();
 
             let point = data.row(i);
-            let mut exact_dists: Vec<(usize, f64)> = candidates.iter()
+            let mut exact_dists: Vec<(usize, f64)> = candidates
+                .iter()
                 .map(|&j| (j, euclidean_distance(point, data.row(j))))
                 .collect();
             exact_dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
@@ -156,13 +158,14 @@ mod tests {
 
     #[test]
     fn test_knn_bruteforce() {
-        let data = Array2::from_shape_vec((5, 2), vec![
-            0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 10.0, 10.0, 11.0, 10.0,
-        ]).unwrap();
+        let data = Array2::from_shape_vec(
+            (5, 2),
+            vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 10.0, 10.0, 11.0, 10.0],
+        )
+        .unwrap();
         let knn = compute_knn_bruteforce(&data, 2);
         assert_eq!(knn.shape(), &[5, 2]);
         assert!(knn[[0, 0]] == 1 || knn[[0, 0]] == 2);
         assert_eq!(knn[[3, 0]], 4);
     }
-
 }

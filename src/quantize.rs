@@ -1,11 +1,10 @@
 use ndarray::Array2;
+use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::Rng;
 
 use crate::codebook::solve_lloyd_max;
 use std::sync::OnceLock;
-
 
 /// Cached Lloyd-Max codebook for N(0,1). Solved once, reused for all encodes.
 fn solve_lloyd_max_n01(n_levels: usize) -> (Vec<f32>, Vec<f32>) {
@@ -18,7 +17,9 @@ fn solve_lloyd_max_n01(n_levels: usize) -> (Vec<f32>, Vec<f32>) {
         _ => return solve_lloyd_max_n01_uncached(n_levels),
     };
 
-    cache.get_or_init(|| solve_lloyd_max_n01_uncached(n_levels)).clone()
+    cache
+        .get_or_init(|| solve_lloyd_max_n01_uncached(n_levels))
+        .clone()
 }
 
 fn solve_lloyd_max_n01_uncached(n_levels: usize) -> (Vec<f32>, Vec<f32>) {
@@ -46,7 +47,11 @@ fn solve_lloyd_max_n01_uncached(n_levels: usize) -> (Vec<f32>, Vec<f32>) {
 fn quantize_scalar_dynamic(val: f32, boundaries: &[f32]) -> u16 {
     let mut idx = 0u16;
     for (i, &b) in boundaries.iter().enumerate() {
-        if val > b { idx = (i + 1) as u16; } else { break; }
+        if val > b {
+            idx = (i + 1) as u16;
+        } else {
+            break;
+        }
     }
     idx
 }
@@ -125,7 +130,6 @@ pub struct QuantizedData {
     residual_norms: Option<Vec<f32>>,
 }
 
-
 impl QuantizedData {
     /// Quantize with 4-bit TurboQuant_prod (3-bit MSE + 1-bit QJL sign)
     pub fn encode(data: &Array2<f64>, seed: u64) -> Self {
@@ -143,22 +147,28 @@ impl QuantizedData {
         // exact Beta distribution in the Gaussian limit.
         // The codebook is the same for all d since our scaling normalizes to N(0,1).
         let (centroids, boundaries) = solve_lloyd_max_n01(match bits {
-            QuantBits::Four => 8,     // 3-bit MSE = 8 levels
-            QuantBits::Eight => 128,  // 7-bit MSE = 128 levels
+            QuantBits::Four => 8,      // 3-bit MSE = 8 levels
+            QuantBits::Eight => 128,   // 7-bit MSE = 128 levels
             QuantBits::Twelve => 2048, // 11-bit MSE = 2048 levels
         });
 
         // Stage 1 rotation: random sign flips for Hadamard
         let mut rng = StdRng::seed_from_u64(seed);
         let signs: Vec<f32> = (0..padded_dims)
-            .map(|_| { let v: f32 = rng.gen_range(0.0..1.0); if v < 0.5 { 1.0 } else { -1.0 } })
+            .map(|_| {
+                let v: f32 = rng.gen_range(0.0..1.0);
+                if v < 0.5 { 1.0 } else { -1.0 }
+            })
             .collect();
 
         // Stage 2 QJL: second randomized Hadamard as orthogonal projection S
         // Different random signs than Stage 1, same WHT → orthogonal, S·S^T = I exactly
         let mut qjl_rng = StdRng::seed_from_u64(seed.wrapping_add(0x514A4C));
         let qjl_signs: Vec<f32> = (0..padded_dims)
-            .map(|_| { let v: f32 = qjl_rng.gen_range(0.0..1.0); if v < 0.5 { 1.0 } else { -1.0 } })
+            .map(|_| {
+                let v: f32 = qjl_rng.gen_range(0.0..1.0);
+                if v < 0.5 { 1.0 } else { -1.0 }
+            })
             .collect();
 
         let mut norms = Vec::with_capacity(n_samples);
@@ -180,14 +190,20 @@ impl QuantizedData {
             let norm: f32 = vec.iter().map(|&v| v * v).sum::<f32>().sqrt();
             norms.push(norm);
             if norm > f32::EPSILON {
-                for v in vec.iter_mut() { *v /= norm; }
+                for v in vec.iter_mut() {
+                    *v /= norm;
+                }
             }
 
             // Stage 1: Hadamard rotation
-            for (v, &s) in vec.iter_mut().zip(signs.iter()) { *v *= s; }
+            for (v, &s) in vec.iter_mut().zip(signs.iter()) {
+                *v *= s;
+            }
             walsh_hadamard_transform(&mut vec);
             let scale = (padded_dims as f32).sqrt();
-            for v in vec.iter_mut() { *v *= scale; }
+            for v in vec.iter_mut() {
+                *v *= scale;
+            }
 
             // Stage 1: MSE quantize + compute residual per coordinate
             let mut mse_indices = vec![0u16; padded_dims];
@@ -208,7 +224,9 @@ impl QuantizedData {
             // S = diag(qjl_signs) · WHT — orthogonal, so S·S^T = I exactly
             // q = sign(S · residual)
             let mut projected = residual.clone();
-            for (v, &s) in projected.iter_mut().zip(qjl_signs.iter()) { *v *= s; }
+            for (v, &s) in projected.iter_mut().zip(qjl_signs.iter()) {
+                *v *= s;
+            }
             walsh_hadamard_transform(&mut projected);
 
             let mut qjl_sign_bits = vec![0u8; padded_dims];
@@ -236,8 +254,8 @@ impl QuantizedData {
                     // 12 bits per coord stored in u16 (2 bytes): (11-bit idx << 1 | sign)
                     for j in 0..padded_dims {
                         let val = (mse_indices[j] << 1) | (qjl_sign_bits[j] as u16);
-                        packed.push((val >> 8) as u8);   // high byte
-                        packed.push((val & 0xFF) as u8);  // low byte
+                        packed.push((val >> 8) as u8); // high byte
+                        packed.push((val & 0xFF) as u8); // low byte
                     }
                 }
             }
@@ -261,7 +279,6 @@ impl QuantizedData {
             residual_norms: Some(per_point_r_norms),
         }
     }
-
 
     /// Dequantize a single vector to f32 (MSE part only, ignoring QJL sign)
     pub fn decode(&self, idx: usize) -> Vec<f32> {
@@ -375,8 +392,10 @@ impl QuantizedData {
                 let mut disagree = 0u32;
                 for k in 0..self.padded_dims {
                     let k2 = k * 2;
-                    let vi = ((self.packed[off_i + k2] as u16) << 8) | (self.packed[off_i + k2 + 1] as u16);
-                    let vj = ((self.packed[off_j + k2] as u16) << 8) | (self.packed[off_j + k2 + 1] as u16);
+                    let vi = ((self.packed[off_i + k2] as u16) << 8)
+                        | (self.packed[off_i + k2 + 1] as u16);
+                    let vj = ((self.packed[off_j + k2] as u16) << 8)
+                        | (self.packed[off_j + k2 + 1] as u16);
                     dot += self.centroids[(vi >> 1) as usize] * self.centroids[(vj >> 1) as usize];
                     disagree += ((vi ^ vj) & 1) as u32;
                 }
@@ -391,8 +410,8 @@ impl QuantizedData {
         const PI_OVER_2: f32 = 1.5707964;
 
         let r_norm_product = match &self.residual_norms {
-            Some(norms) => norms[i] * norms[j],           // per-point (accurate)
-            None => d * self.qjl_r_norm_sq_per_coord,      // global constant (approximate)
+            Some(norms) => norms[i] * norms[j],       // per-point (accurate)
+            None => d * self.qjl_r_norm_sq_per_coord, // global constant (approximate)
         };
         let qjl = PI_OVER_2 / (d * d) * r_norm_product * agreement;
 
@@ -406,7 +425,7 @@ impl QuantizedData {
     pub fn memory_bytes(&self) -> usize {
         self.packed.len()  // quantized data
             + self.norms.len() * 4  // norms
-            + self.signs.len() * 4  // signs
+            + self.signs.len() * 4 // signs
     }
 
     /// Get the packed bytes and norm for a single point (for QuantizedPoint)
@@ -425,13 +444,19 @@ impl QuantizedData {
     }
 
     /// Access raw packed bytes (for GPU upload)
-    pub fn packed_data(&self) -> &[u8] { &self.packed }
+    pub fn packed_data(&self) -> &[u8] {
+        &self.packed
+    }
 
     /// Access norms
-    pub fn norms(&self) -> &[f32] { &self.norms }
+    pub fn norms(&self) -> &[f32] {
+        &self.norms
+    }
 
     /// Get padded dimensionality
-    pub fn padded_dims(&self) -> usize { self.padded_dims }
+    pub fn padded_dims(&self) -> usize {
+        self.padded_dims
+    }
 
     /// Get codebook for GPU upload: centroids + MSE constant at the end
     pub fn sorted_centroids(&self) -> Vec<f32> {
@@ -441,9 +466,10 @@ impl QuantizedData {
     }
 
     /// Get MSE per coordinate (for GPU QJL correction)
-    pub fn mse_per_coord(&self) -> f32 { self.qjl_r_norm_sq_per_coord }
+    pub fn mse_per_coord(&self) -> f32 {
+        self.qjl_r_norm_sq_per_coord
+    }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -462,11 +488,11 @@ mod tests {
 
     #[test]
     fn test_quantize_dequantize_roundtrip() {
-        let data = Array2::from_shape_vec((3, 4), vec![
-            1.0, 2.0, 3.0, 4.0,
-            5.0, 6.0, 7.0, 8.0,
-            -1.0, 0.0, 1.0, 0.5,
-        ]).unwrap();
+        let data = Array2::from_shape_vec(
+            (3, 4),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, -1.0, 0.0, 1.0, 0.5],
+        )
+        .unwrap();
 
         let qdata = QuantizedData::encode(&data, 42);
         assert_eq!(qdata.n_samples, 3);
@@ -475,33 +501,47 @@ mod tests {
         for i in 0..3 {
             let decoded = qdata.decode(i);
             let original: Vec<f64> = (0..4).map(|j| data[[i, j]]).collect();
-            let error: f64 = decoded.iter().zip(original.iter())
+            let error: f64 = decoded
+                .iter()
+                .zip(original.iter())
                 .map(|(&a, &b)| (a as f64 - b).powi(2))
                 .sum::<f64>()
                 .sqrt();
             let norm: f64 = original.iter().map(|x| x * x).sum::<f64>().sqrt();
             // Relative error should be reasonable (< 50% for 4-bit)
-            assert!(error / norm < 0.5,
+            assert!(
+                error / norm < 0.5,
                 "sample {}: error={:.3}, norm={:.3}, ratio={:.3}",
-                i, error, norm, error / norm);
+                i,
+                error,
+                norm,
+                error / norm
+            );
         }
     }
 
     #[test]
     fn test_approx_distance() {
-        let data = Array2::from_shape_vec((4, 8), vec![
-            1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-            1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-            10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0,
-        ]).unwrap();
+        let data = Array2::from_shape_vec(
+            (4, 8),
+            vec![
+                1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0,
+                10.0,
+            ],
+        )
+        .unwrap();
 
         let qdata = QuantizedData::encode(&data, 42);
 
         // Distance from point 0 to 1 should be small (~sqrt(2))
         let d01 = qdata.approx_dist_sq(0, 1).sqrt();
-        assert!((d01 - std::f32::consts::SQRT_2).abs() < 0.5,
-                "d(0,1) = {}, expected ~{}", d01, std::f32::consts::SQRT_2);
+        assert!(
+            (d01 - std::f32::consts::SQRT_2).abs() < 0.5,
+            "d(0,1) = {}, expected ~{}",
+            d01,
+            std::f32::consts::SQRT_2
+        );
 
         // Distance from point 0 to 3 should be large
         let d03 = qdata.approx_dist_sq(0, 3).sqrt();
@@ -523,7 +563,11 @@ mod tests {
         let original_bytes = n * d * 8; // f64
         let quant_bytes = qdata.memory_bytes();
 
-        assert!(quant_bytes < original_bytes / 4,
-                "quantized={} should be < original/4={}", quant_bytes, original_bytes / 4);
+        assert!(
+            quant_bytes < original_bytes / 4,
+            "quantized={} should be < original/4={}",
+            quant_bytes,
+            original_bytes / 4
+        );
     }
 }

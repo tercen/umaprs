@@ -7,13 +7,14 @@
 /// For large d this converges to N(0, 1/d).
 /// We solve Lloyd-Max exactly for the true Beta(d) distribution using
 /// Gauss-Legendre quadrature.
-
 use gauss_quad::GaussLegendre;
 
 /// PDF of a single coordinate after random rotation of a d-dim unit vector.
 /// This is a symmetric Beta distribution on [-1, 1].
 fn beta_pdf(x: f64, d: usize) -> f64 {
-    if x.abs() >= 1.0 { return 0.0; }
+    if x.abs() >= 1.0 {
+        return 0.0;
+    }
     let half_d = d as f64 / 2.0;
     let half_dm1 = (d as f64 - 1.0) / 2.0;
     // Coefficient: Γ(d/2) / (√π · Γ((d-1)/2))
@@ -28,7 +29,9 @@ fn ln_gamma(x: f64) -> f64 {
     // Use the standard library's gamma via exp/ln trick
     // For positive x, Γ(x) = (x-1)!  for integers
     // Use Lanczos approximation
-    if x <= 0.0 { return f64::INFINITY; }
+    if x <= 0.0 {
+        return f64::INFINITY;
+    }
     if x < 0.5 {
         // Reflection formula: Γ(x)·Γ(1-x) = π/sin(πx)
         let pi = std::f64::consts::PI;
@@ -101,7 +104,11 @@ pub fn solve_lloyd_max(d: usize, n_levels: usize) -> (Vec<f32>, Vec<f32>) {
             let numer = integrate(&|x| x * pdf(x), a, b, &quad);
             let denom = integrate(&pdf, a, b, &quad);
 
-            let c = if denom > 1e-15 { numer / denom } else { centroids[i] };
+            let c = if denom > 1e-15 {
+                numer / denom
+            } else {
+                centroids[i]
+            };
             max_shift = max_shift.max((c - centroids[i]).abs());
             new_centroids.push(c);
         }
@@ -131,7 +138,9 @@ pub fn compute_distortion(d: usize, centroids: &[f32], boundaries: &[f32]) -> f3
     let hi = 3.5 * sigma * 3.0;
 
     let mut edges = vec![lo];
-    for &b in boundaries { edges.push(b as f64); }
+    for &b in boundaries {
+        edges.push(b as f64);
+    }
     edges.push(hi);
 
     let mut total = 0.0f64;
@@ -153,8 +162,12 @@ mod tests {
         let quad = GaussLegendre::new(64).unwrap();
         for &d in &[8, 32, 64, 128] {
             let total = integrate(&|x| beta_pdf(x, d), -1.0, 1.0, &quad);
-            assert!((total - 1.0).abs() < 0.01,
-                    "d={}: integral={}, expected 1.0", d, total);
+            assert!(
+                (total - 1.0).abs() < 0.01,
+                "d={}: integral={}, expected 1.0",
+                d,
+                total
+            );
         }
     }
 
@@ -176,16 +189,25 @@ mod tests {
         let (c32, _) = solve_lloyd_max(32, 8);
         let (c128, _) = solve_lloyd_max(128, 8);
         // Higher d → narrower distribution → centroids closer to 0
-        assert!(c128[7].abs() < c32[7].abs(),
-                "d=128 centroids should be tighter: {} vs {}", c128[7], c32[7]);
+        assert!(
+            c128[7].abs() < c32[7].abs(),
+            "d=128 centroids should be tighter: {} vs {}",
+            c128[7],
+            c32[7]
+        );
     }
 
     #[test]
     fn test_distortion_decreases_with_bits() {
-        let (c8, b8) = solve_lloyd_max(32, 8);     // 3-bit
+        let (c8, b8) = solve_lloyd_max(32, 8); // 3-bit
         let (c128, b128) = solve_lloyd_max(32, 128); // 7-bit
         let d8 = compute_distortion(32, &c8, &b8);
         let d128 = compute_distortion(32, &c128, &b128);
-        assert!(d128 < d8, "7-bit distortion {} should be less than 3-bit {}", d128, d8);
+        assert!(
+            d128 < d8,
+            "7-bit distortion {} should be less than 3-bit {}",
+            d128,
+            d8
+        );
     }
 }

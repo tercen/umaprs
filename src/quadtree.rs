@@ -7,8 +7,12 @@ pub struct QuadTree {
 }
 
 struct QuadNode {
-    cx: f64, cy: f64, half: f64,
-    com_x: f64, com_y: f64, mass: f64,
+    cx: f64,
+    cy: f64,
+    half: f64,
+    com_x: f64,
+    com_y: f64,
+    mass: f64,
     children: [u32; 4], // NW, NE, SW, SE; 0 = no child
     is_leaf: bool,
     point_idx: i32, // -1 = empty or subdivided
@@ -17,29 +21,55 @@ struct QuadNode {
 impl QuadTree {
     pub fn build(px: &[f64], py: &[f64]) -> Self {
         let n = px.len();
-        if n == 0 { return Self { nodes: vec![] }; }
+        if n == 0 {
+            return Self { nodes: vec![] };
+        }
 
         let (mut mnx, mut mxx, mut mny, mut mxy) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
         for i in 0..n {
-            mnx = mnx.min(px[i]); mxx = mxx.max(px[i]);
-            mny = mny.min(py[i]); mxy = mxy.max(py[i]);
+            mnx = mnx.min(px[i]);
+            mxx = mxx.max(px[i]);
+            mny = mny.min(py[i]);
+            mxy = mxy.max(py[i]);
         }
         let half = ((mxx - mnx).max(mxy - mny) / 2.0) + 1e-10;
         let cx = (mnx + mxx) / 2.0;
         let cy = (mny + mxy) / 2.0;
 
-        let mut t = Self { nodes: Vec::with_capacity(4 * n) };
+        let mut t = Self {
+            nodes: Vec::with_capacity(4 * n),
+        };
         t.nodes.push(QuadNode {
-            cx, cy, half, com_x: 0.0, com_y: 0.0, mass: 0.0,
-            children: [0; 4], is_leaf: true, point_idx: -1,
+            cx,
+            cy,
+            half,
+            com_x: 0.0,
+            com_y: 0.0,
+            mass: 0.0,
+            children: [0; 4],
+            is_leaf: true,
+            point_idx: -1,
         });
 
-        for i in 0..n { t.insert(0, px[i], py[i], i as i32, px, py, 0); }
+        for i in 0..n {
+            t.insert(0, px[i], py[i], i as i32, px, py, 0);
+        }
         t
     }
 
-    fn insert(&mut self, ni: usize, x: f64, y: f64, pidx: i32, px: &[f64], py: &[f64], depth: usize) {
-        if depth > MAX_DEPTH { return; }
+    fn insert(
+        &mut self,
+        ni: usize,
+        x: f64,
+        y: f64,
+        pidx: i32,
+        px: &[f64],
+        py: &[f64],
+        depth: usize,
+    ) {
+        if depth > MAX_DEPTH {
+            return;
+        }
 
         let old_m = self.nodes[ni].mass;
         let new_m = old_m + 1.0;
@@ -65,9 +95,15 @@ impl QuadTree {
                 let ci = self.nodes.len() as u32;
                 self.nodes[ni].children[q] = ci;
                 self.nodes.push(QuadNode {
-                    cx: cx + off[q].0 * qh, cy: cy + off[q].1 * qh, half: qh,
-                    com_x: 0.0, com_y: 0.0, mass: 0.0,
-                    children: [0; 4], is_leaf: true, point_idx: -1,
+                    cx: cx + off[q].0 * qh,
+                    cy: cy + off[q].1 * qh,
+                    half: qh,
+                    com_x: 0.0,
+                    com_y: 0.0,
+                    mass: 0.0,
+                    children: [0; 4],
+                    is_leaf: true,
+                    point_idx: -1,
                 });
             }
             // Re-insert old point
@@ -89,13 +125,21 @@ impl QuadTree {
     }
 
     fn quadrant(cx: f64, cy: f64, x: f64, y: f64) -> usize {
-        if x <= cx { if y > cy { 0 } else { 2 } }
-        else { if y > cy { 1 } else { 3 } }
+        if x <= cx {
+            if y > cy { 0 } else { 2 }
+        } else {
+            if y > cy { 1 } else { 3 }
+        }
     }
 
     /// Barnes-Hut repulsion for all points. Returns (fx, fy, Z_normalization).
     /// Parallelized — each point's tree traversal is independent.
-    pub fn compute_repulsion(&self, px: &[f64], py: &[f64], theta: f64) -> (Vec<f64>, Vec<f64>, f64) {
+    pub fn compute_repulsion(
+        &self,
+        px: &[f64],
+        py: &[f64],
+        theta: f64,
+    ) -> (Vec<f64>, Vec<f64>, f64) {
         use rayon::prelude::*;
         let n = px.len();
         let results: Vec<(f64, f64, f64)> = (0..n)
@@ -115,9 +159,13 @@ impl QuadTree {
     }
 
     fn rep_single(&self, ni: usize, x: f64, y: f64, theta: f64) -> (f64, f64, f64) {
-        if ni >= self.nodes.len() { return (0.0, 0.0, 0.0); }
+        if ni >= self.nodes.len() {
+            return (0.0, 0.0, 0.0);
+        }
         let n = &self.nodes[ni];
-        if n.mass < 0.5 { return (0.0, 0.0, 0.0); }
+        if n.mass < 0.5 {
+            return (0.0, 0.0, 0.0);
+        }
 
         let dx = x - n.com_x;
         let dy = y - n.com_y;
@@ -125,17 +173,23 @@ impl QuadTree {
 
         // Use cell approximation if far enough or leaf
         if n.is_leaf || (d2 > 1e-10 && (2.0 * n.half) * (2.0 * n.half) < theta * theta * d2) {
-            if d2 < 1e-10 && n.mass < 1.5 { return (0.0, 0.0, 0.0); } // skip self
+            if d2 < 1e-10 && n.mass < 1.5 {
+                return (0.0, 0.0, 0.0);
+            } // skip self
             let q = 1.0 / (1.0 + d2);
             return (n.mass * q * q * dx, n.mass * q * q * dy, n.mass * q);
         }
 
-        let mut fx = 0.0; let mut fy = 0.0; let mut z = 0.0;
+        let mut fx = 0.0;
+        let mut fy = 0.0;
+        let mut z = 0.0;
         for q in 0..4 {
             let c = n.children[q] as usize;
             if c > 0 {
                 let (cfx, cfy, cz) = self.rep_single(c, x, y, theta);
-                fx += cfx; fy += cfy; z += cz;
+                fx += cfx;
+                fy += cfy;
+                z += cz;
             }
         }
         (fx, fy, z)

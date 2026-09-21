@@ -15,21 +15,12 @@ pub struct SparseGraph {
 impl SparseGraph {
     /// Build a CSR graph from COO-style triplets (row, col, val).
     /// Entries must not contain duplicates.
-    pub fn from_triplets(
-        n_nodes: usize,
-        rows: &[usize],
-        cols: &[usize],
-        vals: &[f64],
-    ) -> Self {
+    pub fn from_triplets(n_nodes: usize, rows: &[usize], cols: &[usize], vals: &[f64]) -> Self {
         let nnz = rows.len();
 
         // Sort by (row, col)
         let mut indices: Vec<usize> = (0..nnz).collect();
-        indices.sort_by(|&a, &b| {
-            rows[a]
-                .cmp(&rows[b])
-                .then_with(|| cols[a].cmp(&cols[b]))
-        });
+        indices.sort_by(|&a, &b| rows[a].cmp(&rows[b]).then_with(|| cols[a].cmp(&cols[b])));
 
         let mut sorted_cols = Vec::with_capacity(nnz);
         let mut sorted_vals = Vec::with_capacity(nnz);

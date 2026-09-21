@@ -1,8 +1,8 @@
 use ndarray::Array2;
-use umaprs::UMAP;
 use std::fs::File;
-use std::io::{Write, BufReader, BufRead};
+use std::io::{BufRead, BufReader, Write};
 use std::time::Instant;
+use umaprs::UMAP;
 
 fn read_csv(path: &str) -> Array2<f64> {
     let file = File::open(path).unwrap();

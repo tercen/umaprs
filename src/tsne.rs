@@ -1,3 +1,4 @@
+use crate::quadtree::QuadTree;
 /// t-SNE (t-distributed Stochastic Neighbor Embedding)
 ///
 /// Uses the same kNN infrastructure as UMAP:
@@ -7,10 +8,8 @@
 ///
 /// The key difference from UMAP: Gaussian affinities in high-d,
 /// Student-t (Cauchy) kernel in low-d, KL divergence loss.
-
 use ndarray::Array2;
 use rayon::prelude::*;
-use crate::quadtree::QuadTree;
 
 /// Compute pairwise conditional probabilities from kNN distances.
 /// Uses binary search for per-point sigma to match target perplexity.
@@ -44,7 +43,10 @@ fn compute_p_matrix(
                 sum_exp += (-beta * knn_dists[[i, ki]] * knn_dists[[i, ki]]).exp();
             }
 
-            if sum_exp < 1e-20 { lo = sigma; continue; }
+            if sum_exp < 1e-20 {
+                lo = sigma;
+                continue;
+            }
 
             // Entropy = -Σ p log p
             let mut entropy = 0.0;
@@ -55,8 +57,14 @@ fn compute_p_matrix(
                 }
             }
 
-            if (entropy - target_entropy).abs() < 1e-5 { break; }
-            if entropy > target_entropy { hi = sigma; } else { lo = sigma; }
+            if (entropy - target_entropy).abs() < 1e-5 {
+                break;
+            }
+            if entropy > target_entropy {
+                hi = sigma;
+            } else {
+                lo = sigma;
+            }
         }
 
         // Compute final p(j|i) with converged sigma
@@ -102,10 +110,7 @@ fn compute_p_matrix(
 }
 
 /// Compute kNN distances from data using kd-tree/HNSW
-fn compute_knn_dists(
-    data: &Array2<f64>,
-    knn_indices: &Array2<usize>,
-) -> Array2<f64> {
+fn compute_knn_dists(data: &Array2<f64>, knn_indices: &Array2<usize>) -> Array2<f64> {
     let n = data.nrows();
     let k = knn_indices.ncols();
     let mut knn_dists = Array2::zeros((n, k));
@@ -113,9 +118,13 @@ fn compute_knn_dists(
     for i in 0..n {
         for ki in 0..k {
             let j = knn_indices[[i, ki]];
-            let d: f64 = data.row(i).iter().zip(data.row(j).iter())
+            let d: f64 = data
+                .row(i)
+                .iter()
+                .zip(data.row(j).iter())
                 .map(|(&a, &b)| (a - b).powi(2))
-                .sum::<f64>().sqrt();
+                .sum::<f64>()
+                .sqrt();
             knn_dists[[i, ki]] = d;
         }
     }
@@ -138,10 +147,14 @@ impl CompactP {
     pub fn from_triplets(n: usize, rows: &[usize], cols: &[usize], vals: &[f64]) -> Self {
         // Count entries per row
         let mut counts = vec![0u32; n];
-        for &r in rows { counts[r] += 1; }
+        for &r in rows {
+            counts[r] += 1;
+        }
 
         let mut row_offsets = vec![0u32; n + 1];
-        for i in 0..n { row_offsets[i + 1] = row_offsets[i] + counts[i]; }
+        for i in 0..n {
+            row_offsets[i + 1] = row_offsets[i] + counts[i];
+        }
         let nnz = row_offsets[n] as usize;
 
         let mut col_indices = vec![0u32; nnz];
@@ -156,7 +169,11 @@ impl CompactP {
             pos[r] += 1;
         }
 
-        Self { row_offsets, col_indices, values }
+        Self {
+            row_offsets,
+            col_indices,
+            values,
+        }
     }
 
     pub fn memory_bytes(&self) -> usize {
@@ -185,9 +202,16 @@ pub fn tsne_optimize_bh_compact(
 
     for iter in 0..n_iter {
         let momentum = if iter < 250 { 0.5 } else { 0.8 };
-        let exag = if iter < early_exaggeration_iter { early_exaggeration as f32 } else { 1.0f32 };
+        let exag = if iter < early_exaggeration_iter {
+            early_exaggeration as f32
+        } else {
+            1.0f32
+        };
 
-        for i in 0..n { ex[i] = embedding[[i, 0]]; ey[i] = embedding[[i, 1]]; }
+        for i in 0..n {
+            ex[i] = embedding[[i, 0]];
+            ey[i] = embedding[[i, 1]];
+        }
 
         let tree = QuadTree::build(&ex, &ey);
         let (rep_fx, rep_fy, z_sum) = tree.compute_repulsion(&ex, &ey, theta);
@@ -222,10 +246,16 @@ pub fn tsne_optimize_bh_compact(
         for i in 0..n {
             let gx = grad_x[i];
             let gy = grad_y[i];
-            if (gx > 0.0) != (vel_x[i] > 0.0) { gains_x[i] = (gains_x[i] + 0.2).min(10.0); }
-            else { gains_x[i] = (gains_x[i] * 0.8).max(0.01); }
-            if (gy > 0.0) != (vel_y[i] > 0.0) { gains_y[i] = (gains_y[i] + 0.2).min(10.0); }
-            else { gains_y[i] = (gains_y[i] * 0.8).max(0.01); }
+            if (gx > 0.0) != (vel_x[i] > 0.0) {
+                gains_x[i] = (gains_x[i] + 0.2).min(10.0);
+            } else {
+                gains_x[i] = (gains_x[i] * 0.8).max(0.01);
+            }
+            if (gy > 0.0) != (vel_y[i] > 0.0) {
+                gains_y[i] = (gains_y[i] + 0.2).min(10.0);
+            } else {
+                gains_y[i] = (gains_y[i] * 0.8).max(0.01);
+            }
             vel_x[i] = momentum * vel_x[i] - learning_rate * gains_x[i] * gx;
             vel_y[i] = momentum * vel_y[i] - learning_rate * gains_y[i] * gy;
             embedding[[i, 0]] += vel_x[i];
@@ -274,10 +304,17 @@ pub fn tsne_optimize_bh(
 
     for iter in 0..n_iter {
         let momentum = if iter < 250 { 0.5 } else { 0.8 };
-        let exag = if iter < early_exaggeration_iter { early_exaggeration } else { 1.0 };
+        let exag = if iter < early_exaggeration_iter {
+            early_exaggeration
+        } else {
+            1.0
+        };
 
         // Extract current positions (reuse buffers)
-        for i in 0..n { ex[i] = embedding[[i, 0]]; ey[i] = embedding[[i, 1]]; }
+        for i in 0..n {
+            ex[i] = embedding[[i, 0]];
+            ey[i] = embedding[[i, 1]];
+        }
 
         // Build quadtree and compute repulsive forces O(n log n)
         let t0 = std::time::Instant::now();
@@ -319,10 +356,16 @@ pub fn tsne_optimize_bh(
             let gx = grad_x[i];
             let gy = grad_y[i];
 
-            if (gx > 0.0) != (vel_x[i] > 0.0) { gains_x[i] = (gains_x[i] + 0.2).min(10.0); }
-            else { gains_x[i] = (gains_x[i] * 0.8).max(0.01); }
-            if (gy > 0.0) != (vel_y[i] > 0.0) { gains_y[i] = (gains_y[i] + 0.2).min(10.0); }
-            else { gains_y[i] = (gains_y[i] * 0.8).max(0.01); }
+            if (gx > 0.0) != (vel_x[i] > 0.0) {
+                gains_x[i] = (gains_x[i] + 0.2).min(10.0);
+            } else {
+                gains_x[i] = (gains_x[i] * 0.8).max(0.01);
+            }
+            if (gy > 0.0) != (vel_y[i] > 0.0) {
+                gains_y[i] = (gains_y[i] + 0.2).min(10.0);
+            } else {
+                gains_y[i] = (gains_y[i] * 0.8).max(0.01);
+            }
 
             vel_x[i] = momentum * vel_x[i] - learning_rate * gains_x[i] * gx;
             vel_y[i] = momentum * vel_y[i] - learning_rate * gains_y[i] * gy;
@@ -358,8 +401,16 @@ pub fn tsne_optimize(
     let momentum_final = 0.8;
 
     for iter in 0..n_iter {
-        let momentum = if iter < 250 { momentum_init } else { momentum_final };
-        let exag = if iter < early_exaggeration_iter { early_exaggeration } else { 1.0 };
+        let momentum = if iter < 250 {
+            momentum_init
+        } else {
+            momentum_final
+        };
+        let exag = if iter < early_exaggeration_iter {
+            early_exaggeration
+        } else {
+            1.0
+        };
 
         // Compute Q matrix denominator (Student-t kernel)
         // Q_ij = (1 + ||y_i - y_j||²)^{-1} / Σ_{k≠l} (1 + ||y_k - y_l||²)^{-1}
@@ -472,9 +523,17 @@ pub fn run_tsne(
     learning_rate: f64,
     random_state: Option<u64>,
 ) -> Array2<f64> {
-    run_tsne_params(data, knn_indices, &TsneParams {
-        perplexity, n_iter, learning_rate, random_state, ..Default::default()
-    })
+    run_tsne_params(
+        data,
+        knn_indices,
+        &TsneParams {
+            perplexity,
+            n_iter,
+            learning_rate,
+            random_state,
+            ..Default::default()
+        },
+    )
 }
 
 /// Run t-SNE with full parameter control
@@ -485,8 +544,10 @@ pub fn run_tsne_params(
 ) -> Array2<f64> {
     let n = data.nrows();
 
-    eprintln!("t-SNE: {} points, perplexity={}, exag={}, exag_iter={}",
-              n, params.perplexity, params.early_exaggeration, params.early_exaggeration_iter);
+    eprintln!(
+        "t-SNE: {} points, perplexity={}, exag={}, exag_iter={}",
+        n, params.perplexity, params.early_exaggeration, params.early_exaggeration_iter
+    );
 
     let knn_dists = compute_knn_dists(data, knn_indices);
 
@@ -500,9 +561,14 @@ pub fn run_tsne_params(
 
     let compact = CompactP::from_triplets(n, &p_rows, &p_cols, &p_vals);
     eprintln!("  P matrix: {} MB", compact.memory_bytes() / 1024 / 1024);
-    drop(p_rows); drop(p_cols); drop(p_vals);
+    drop(p_rows);
+    drop(p_cols);
+    drop(p_vals);
 
-    eprintln!("  Optimizing ({} iterations, theta={})...", params.n_iter, params.theta);
+    eprintln!(
+        "  Optimizing ({} iterations, theta={})...",
+        params.n_iter, params.theta
+    );
     tsne_optimize_bh_compact(
         &mut embedding,
         &compact,
@@ -542,8 +608,13 @@ pub fn run_tsne_compressed(
 
     // Compact P + drop intermediates
     let compact = CompactP::from_triplets(n, &p_rows, &p_cols, &p_vals);
-    eprintln!("  P matrix: {} MB (compact CSR)", compact.memory_bytes() / 1024 / 1024);
-    drop(p_rows); drop(p_cols); drop(p_vals);
+    eprintln!(
+        "  P matrix: {} MB (compact CSR)",
+        compact.memory_bytes() / 1024 / 1024
+    );
+    drop(p_rows);
+    drop(p_cols);
+    drop(p_vals);
     drop(knn);
 
     // PCA init
@@ -552,7 +623,10 @@ pub fn run_tsne_compressed(
     embedding.mapv_inplace(|x| x * 0.01);
 
     // Optimize
-    eprintln!("  Optimizing ({} iterations, Barnes-Hut theta=0.5)...", n_iter);
+    eprintln!(
+        "  Optimizing ({} iterations, Barnes-Hut theta=0.5)...",
+        n_iter
+    );
     tsne_optimize_bh_compact(
         &mut embedding,
         &compact,
@@ -602,16 +676,27 @@ fn compute_p_matrix_compressed(
             for &d in &dists {
                 sum_exp += (-beta * d * d).exp();
             }
-            if sum_exp < 1e-20 { lo = sigma; continue; }
+            if sum_exp < 1e-20 {
+                lo = sigma;
+                continue;
+            }
 
             let mut entropy = 0.0;
             for &d in &dists {
                 let p = (-beta * d * d).exp() / sum_exp;
-                if p > 1e-20 { entropy -= p * p.ln(); }
+                if p > 1e-20 {
+                    entropy -= p * p.ln();
+                }
             }
 
-            if (entropy - target_entropy).abs() < 1e-5 { break; }
-            if entropy > target_entropy { hi = sigma; } else { lo = sigma; }
+            if (entropy - target_entropy).abs() < 1e-5 {
+                break;
+            }
+            if entropy > target_entropy {
+                hi = sigma;
+            } else {
+                lo = sigma;
+            }
         }
 
         // Final probabilities

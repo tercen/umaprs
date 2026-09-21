@@ -1,8 +1,8 @@
 use ndarray::Array2;
-use rayon::prelude::*;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use rand::seq::SliceRandom;
+use rayon::prelude::*;
 use std::collections::HashMap;
 
 use crate::kdtree::KdTree;
@@ -93,7 +93,9 @@ impl UmapModel {
             };
             panic!(
                 "Input has {} features but model expects {}{}",
-                new_data.ncols(), expected_dims, feat_info
+                new_data.ncols(),
+                expected_dims,
+                feat_info
             );
         }
 
@@ -122,7 +124,9 @@ impl UmapModel {
                 let mut dists: Vec<(usize, f32)> = (0..n_train)
                     .map(|ti| {
                         let t_slice = &flat[ti * n_dims..(ti + 1) * n_dims];
-                        let d: f32 = q_slice.iter().zip(t_slice.iter())
+                        let d: f32 = q_slice
+                            .iter()
+                            .zip(t_slice.iter())
                             .map(|(a, b)| (a - b) * (a - b))
                             .sum();
                         (ti, d)
@@ -138,9 +142,7 @@ impl UmapModel {
 
                 // Fuzzy weights
                 let rho = nn_dists[0].max(0.0);
-                let sigma: f64 = nn_indices.iter()
-                    .map(|&i| self.sigmas[i])
-                    .sum::<f64>() / k as f64;
+                let sigma: f64 = nn_indices.iter().map(|&i| self.sigmas[i]).sum::<f64>() / k as f64;
 
                 let mut weights = Vec::with_capacity(k);
                 for &d in &nn_dists {
@@ -231,7 +233,13 @@ impl UmapModel {
             writeln!(f, "{},sigma,{}", subj, self.sigmas[i])?;
             writeln!(f, "{},rho,{}", subj, self.rhos[i])?;
             for j in 0..n_dims {
-                writeln!(f, "{},{},{}", subj, feat_names[j], self.training_data[[i, j]])?;
+                writeln!(
+                    f,
+                    "{},{},{}",
+                    subj,
+                    feat_names[j],
+                    self.training_data[[i, j]]
+                )?;
             }
         }
 
@@ -247,10 +255,17 @@ impl UmapModel {
         let mut first = true;
         for line in reader.lines() {
             let line = line?;
-            if first { first = false; continue; }
+            if first {
+                first = false;
+                continue;
+            }
             let parts: Vec<&str> = line.splitn(3, ',').collect();
             if parts.len() == 3 {
-                triples.push((parts[0].to_string(), parts[1].to_string(), parts[2].to_string()));
+                triples.push((
+                    parts[0].to_string(),
+                    parts[1].to_string(),
+                    parts[2].to_string(),
+                ));
             }
         }
         Ok(Self::from_triples(&triples))
@@ -264,7 +279,10 @@ impl UmapModel {
             if s == "model" {
                 params.insert(p.clone(), o.clone());
             } else if s.starts_with("point_") {
-                point_data.entry(s.clone()).or_default().insert(p.clone(), o.clone());
+                point_data
+                    .entry(s.clone())
+                    .or_default()
+                    .insert(p.clone(), o.clone());
             }
         }
 
@@ -294,8 +312,12 @@ impl UmapModel {
                         embedding[[i, c]] = v.parse().unwrap();
                     }
                 }
-                if let Some(v) = pdata.get("sigma") { sigmas[i] = v.parse().unwrap(); }
-                if let Some(v) = pdata.get("rho") { rhos[i] = v.parse().unwrap(); }
+                if let Some(v) = pdata.get("sigma") {
+                    sigmas[i] = v.parse().unwrap();
+                }
+                if let Some(v) = pdata.get("rho") {
+                    rhos[i] = v.parse().unwrap();
+                }
                 for j in 0..n_dims {
                     if let Some(v) = pdata.get(&feature_names[j]) {
                         training_data[[i, j]] = v.parse().unwrap();
@@ -305,8 +327,13 @@ impl UmapModel {
         }
 
         Self {
-            training_data, embedding, sigmas, rhos,
-            a, b, n_neighbors,
+            training_data,
+            embedding,
+            sigmas,
+            rhos,
+            a,
+            b,
+            n_neighbors,
             feature_names: Some(feature_names),
         }
     }
@@ -319,11 +346,14 @@ mod tests {
     #[test]
     fn test_csv_roundtrip() {
         let model = UmapModel {
-            training_data: Array2::from_shape_vec((3, 2), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
+            training_data: Array2::from_shape_vec((3, 2), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+                .unwrap(),
             embedding: Array2::from_shape_vec((3, 2), vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6]).unwrap(),
             sigmas: vec![0.5, 0.6, 0.7],
             rhos: vec![0.1, 0.2, 0.3],
-            a: 1.577, b: 0.8951, n_neighbors: 15,
+            a: 1.577,
+            b: 0.8951,
+            n_neighbors: 15,
             feature_names: Some(vec!["x".into(), "y".into()]),
         };
 
@@ -357,7 +387,9 @@ mod tests {
             embedding: Array2::zeros((5, 2)),
             sigmas: vec![1.0; 5],
             rhos: vec![0.0; 5],
-            a: 1.577, b: 0.8951, n_neighbors: 3,
+            a: 1.577,
+            b: 0.8951,
+            n_neighbors: 3,
             feature_names: Some(vec!["a".into(), "b".into(), "c".into()]),
         };
 

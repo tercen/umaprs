@@ -1,7 +1,7 @@
 use ndarray::Array2;
-use rand::prelude::*;
 use rand::SeedableRng;
-use rand::rngs::{StdRng, SmallRng};
+use rand::prelude::*;
+use rand::rngs::{SmallRng, StdRng};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -32,9 +32,13 @@ const GRAD_CLAMP_LO: f32 = -4.0;
 #[inline(always)]
 fn clamp_grad(val: f32) -> f32 {
     // branchless clamp
-    if val > GRAD_CLAMP_HI { GRAD_CLAMP_HI }
-    else if val < GRAD_CLAMP_LO { GRAD_CLAMP_LO }
-    else { val }
+    if val > GRAD_CLAMP_HI {
+        GRAD_CLAMP_HI
+    } else if val < GRAD_CLAMP_LO {
+        GRAD_CLAMP_LO
+    } else {
+        val
+    }
 }
 
 /// Epoch-based edge sampler matching uwot's Sampler class.
@@ -113,7 +117,10 @@ pub fn optimize_layout(
 ) {
     let n_samples = embedding.nrows();
     let n_components = embedding.ncols();
-    assert_eq!(n_components, 2, "Only 2D embedding supported for optimized path");
+    assert_eq!(
+        n_components, 2,
+        "Only 2D embedding supported for optimized path"
+    );
 
     let (a_f64, b_f64) = find_ab_params(min_dist, spread);
     let a = a_f64 as f32;
@@ -148,18 +155,24 @@ pub fn optimize_layout(
         let frac = b - e as f32;
         let u: f64 = a as f64;
         let bits = u.to_bits() as i64;
-        let approx_bits = (frac as f64 * (bits - 4606853616395542528) as f64
-            + 4606853616395542528.0) as u64;
+        let approx_bits =
+            (frac as f64 * (bits - 4606853616395542528) as f64 + 4606853616395542528.0) as u64;
         let approx = f64::from_bits(approx_bits);
         let mut r = 1.0f64;
         let mut base = a as f64;
         let mut exp = if e >= 0 { e } else { -e };
         while exp > 0 {
-            if exp & 1 == 1 { r *= base; }
+            if exp & 1 == 1 {
+                r *= base;
+            }
             base *= base;
             exp >>= 1;
         }
-        if e >= 0 { (r * approx) as f32 } else { (approx / r) as f32 }
+        if e >= 0 {
+            (r * approx) as f32
+        } else {
+            (approx / r) as f32
+        }
     }
 
     // Atomic f32 helpers for HogWild! parallel SGD
@@ -208,54 +221,63 @@ pub fn optimize_layout(
         }
 
         // Process in parallel with per-thread SmallRng (fast, no StdRng per edge)
-        let epoch_seed = random_state.unwrap_or(42).wrapping_add(epoch as u64 * 1000003);
-        active_edges.par_chunks(256).enumerate().for_each(|(chunk_idx, chunk)| {
-            let mut local_rng = SmallRng::seed_from_u64(epoch_seed.wrapping_add(chunk_idx as u64 * 999983));
+        let epoch_seed = random_state
+            .unwrap_or(42)
+            .wrapping_add(epoch as u64 * 1000003);
+        active_edges
+            .par_chunks(256)
+            .enumerate()
+            .for_each(|(chunk_idx, chunk)| {
+                let mut local_rng =
+                    SmallRng::seed_from_u64(epoch_seed.wrapping_add(chunk_idx as u64 * 999983));
 
-            for &(edge, n_neg) in chunk {
-                let i = unsafe { *heads.get_unchecked(edge) } as usize;
-                let j = unsafe { *tails.get_unchecked(edge) } as usize;
-                let i2 = i * 2;
-                let j2 = j * 2;
+                for &(edge, n_neg) in chunk {
+                    let i = unsafe { *heads.get_unchecked(edge) } as usize;
+                    let j = unsafe { *tails.get_unchecked(edge) } as usize;
+                    let i2 = i * 2;
+                    let j2 = j * 2;
 
-                let ix = atomic_load_f32(&emb[i2]);
-                let iy = atomic_load_f32(&emb[i2 + 1]);
-                let jx = atomic_load_f32(&emb[j2]);
-                let jy = atomic_load_f32(&emb[j2 + 1]);
+                    let ix = atomic_load_f32(&emb[i2]);
+                    let iy = atomic_load_f32(&emb[i2 + 1]);
+                    let jx = atomic_load_f32(&emb[j2]);
+                    let jy = atomic_load_f32(&emb[j2 + 1]);
 
-                let dx = ix - jx;
-                let dy = iy - jy;
-                let dist_sq = (dx * dx + dy * dy).max(f32::EPSILON);
+                    let dx = ix - jx;
+                    let dy = iy - jy;
+                    let dist_sq = (dx * dx + dy * dy).max(f32::EPSILON);
 
-                let pd2b = fast_pow(dist_sq, b);
-                let attr_coeff = (a_b_m2 * pd2b) / (dist_sq * (a * pd2b + 1.0));
+                    let pd2b = fast_pow(dist_sq, b);
+                    let attr_coeff = (a_b_m2 * pd2b) / (dist_sq * (a * pd2b + 1.0));
 
-                let ux = alpha * clamp_grad(attr_coeff * dx);
-                let uy = alpha * clamp_grad(attr_coeff * dy);
+                    let ux = alpha * clamp_grad(attr_coeff * dx);
+                    let uy = alpha * clamp_grad(attr_coeff * dy);
 
-                atomic_add_f32(&emb[i2], ux);
-                atomic_add_f32(&emb[i2 + 1], uy);
-                atomic_add_f32(&emb[j2], -ux);
-                atomic_add_f32(&emb[j2 + 1], -uy);
+                    atomic_add_f32(&emb[i2], ux);
+                    atomic_add_f32(&emb[i2 + 1], uy);
+                    atomic_add_f32(&emb[j2], -ux);
+                    atomic_add_f32(&emb[j2 + 1], -uy);
 
-                for _ in 0..n_neg {
-                    let neg = local_rng.gen_range(0..n_samples_u32) as usize;
-                    if neg == i { continue; }
+                    for _ in 0..n_neg {
+                        let neg = local_rng.gen_range(0..n_samples_u32) as usize;
+                        if neg == i {
+                            continue;
+                        }
 
-                    let n2 = neg * 2;
-                    let nx = atomic_load_f32(&emb[n2]);
-                    let ny = atomic_load_f32(&emb[n2 + 1]);
-                    let ndx = ix - nx;
-                    let ndy = iy - ny;
-                    let ndist_sq = (ndx * ndx + ndy * ndy).max(f32::EPSILON);
+                        let n2 = neg * 2;
+                        let nx = atomic_load_f32(&emb[n2]);
+                        let ny = atomic_load_f32(&emb[n2 + 1]);
+                        let ndx = ix - nx;
+                        let ndy = iy - ny;
+                        let ndist_sq = (ndx * ndx + ndy * ndy).max(f32::EPSILON);
 
-                    let rep_coeff = gamma_b_2 / ((0.001 + ndist_sq) * (a * fast_pow(ndist_sq, b) + 1.0));
+                        let rep_coeff =
+                            gamma_b_2 / ((0.001 + ndist_sq) * (a * fast_pow(ndist_sq, b) + 1.0));
 
-                    atomic_add_f32(&emb[i2], alpha * clamp_grad(rep_coeff * ndx));
-                    atomic_add_f32(&emb[i2 + 1], alpha * clamp_grad(rep_coeff * ndy));
+                        atomic_add_f32(&emb[i2], alpha * clamp_grad(rep_coeff * ndx));
+                        atomic_add_f32(&emb[i2 + 1], alpha * clamp_grad(rep_coeff * ndy));
+                    }
                 }
-            }
-        });
+            });
     }
 
     // Center and convert back to f64
@@ -295,20 +317,28 @@ mod tests {
 
     #[test]
     fn test_optimize_layout() {
-        let mut embedding = Array2::from_shape_vec((5, 2), vec![
-            0.0, 0.0,
-            1.0, 0.0,
-            0.0, 1.0,
-            1.0, 1.0,
-            0.5, 0.5,
-        ]).unwrap();
+        let mut embedding = Array2::from_shape_vec(
+            (5, 2),
+            vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.5, 0.5],
+        )
+        .unwrap();
 
         let rows = vec![0, 1, 2, 3];
         let cols = vec![1, 2, 3, 4];
         let vals = vec![1.0, 1.0, 1.0, 1.0];
         let graph = SparseGraph::from_triplets(5, &rows, &cols, &vals);
 
-        optimize_layout(&mut embedding, &graph, 10, 1.0, 0.1, 1.0, 5.0, 1.0, Some(42));
+        optimize_layout(
+            &mut embedding,
+            &graph,
+            10,
+            1.0,
+            0.1,
+            1.0,
+            5.0,
+            1.0,
+            Some(42),
+        );
         assert_eq!(embedding.shape(), &[5, 2]);
 
         let mean_x: f64 = embedding.column(0).mean().unwrap();
