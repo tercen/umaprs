@@ -1,9 +1,9 @@
+use crate::linalg::eigh;
 use ndarray::{Array2, Axis};
 use ndarray_rand::RandomExt;
-use ndarray_rand::rand_distr::{Uniform, StandardNormal, Distribution};
+use ndarray_rand::rand_distr::{Distribution, StandardNormal, Uniform};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use ndarray_linalg::{Eigh, UPLO};
 
 use crate::sparse::SparseGraph;
 
@@ -33,8 +33,11 @@ pub fn spectral_layout_with_data(
     if n_samples > SPECTRAL_DENSE_THRESHOLD {
         // Use PCA initialization if data is available (like uwot's "spca" fallback)
         if let Some(data) = data {
-            eprintln!("Using PCA initialization ({} samples, {} dims)",
-                      n_samples, data.ncols());
+            eprintln!(
+                "Using PCA initialization ({} samples, {} dims)",
+                n_samples,
+                data.ncols()
+            );
             return pca_initialization(data, n_components, random_state);
         }
         eprintln!(
@@ -51,7 +54,10 @@ pub fn spectral_layout_with_data(
     match compute_spectral_embedding(&laplacian, n_components, random_state) {
         Ok(emb) => emb,
         Err(e) => {
-            eprintln!("Warning: Spectral initialization failed ({}), using random initialization", e);
+            eprintln!(
+                "Warning: Spectral initialization failed ({}), using random initialization",
+                e
+            );
             random_initialization(n_samples, n_components, random_state)
         }
     }
@@ -101,13 +107,15 @@ fn compute_spectral_embedding(
     let n_samples = laplacian.nrows();
 
     // Compute all eigenvalues and eigenvectors using symmetric eigendecomposition
-    let (eigenvalues, eigenvectors) = laplacian.clone().eigh(UPLO::Lower)?;
+    let (eigenvalues, eigenvectors) = eigh(laplacian)?;
 
     // Find indices of smallest eigenvalues
     // Sort eigenvalue indices by value (ascending)
     let mut indices: Vec<usize> = (0..eigenvalues.len()).collect();
     indices.sort_by(|&a, &b| {
-        eigenvalues[a].partial_cmp(&eigenvalues[b]).unwrap_or(std::cmp::Ordering::Equal)
+        eigenvalues[a]
+            .partial_cmp(&eigenvalues[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
 
     // Debug: print first few eigenvalues
@@ -121,8 +129,13 @@ fn compute_spectral_embedding(
     let start_idx = 1.min(indices.len() - 1);
     let end_idx = (start_idx + n_components).min(indices.len());
 
-    eprintln!("Using eigenvectors {} to {} (eigenvalues {:.6} to {:.6})",
-              start_idx, end_idx-1, eigenvalues[indices[start_idx]], eigenvalues[indices[end_idx-1]]);
+    eprintln!(
+        "Using eigenvectors {} to {} (eigenvalues {:.6} to {:.6})",
+        start_idx,
+        end_idx - 1,
+        eigenvalues[indices[start_idx]],
+        eigenvalues[indices[end_idx - 1]]
+    );
 
     // Build embedding from eigenvectors
     let mut embedding = Array2::zeros((n_samples, n_components));
@@ -154,7 +167,8 @@ fn compute_spectral_embedding(
     }
 
     // Scale to reasonable range (like uwot: typically [-10, 10])
-    let max_abs = embedding.iter()
+    let max_abs = embedding
+        .iter()
         .map(|&x| x.abs())
         .fold(0.0f64, f64::max)
         .max(1e-10);
@@ -183,7 +197,8 @@ pub(crate) fn random_initialization(
     );
 
     // Scale to reasonable range
-    let max_val = embedding.iter()
+    let max_val = embedding
+        .iter()
         .fold(0.0f64, |acc, &x: &f64| acc.max(x.abs()))
         .max(1e-10);
     let scale = 10.0 / max_val;
@@ -218,7 +233,9 @@ pub(crate) fn pca_reduce(data: &Array2<f64>, n_dims: usize) -> Array2<f64> {
             for k in j..d {
                 let v = row[j] * row[k];
                 cov[[j, k]] += v;
-                if j != k { cov[[k, j]] += v; }
+                if j != k {
+                    cov[[k, j]] += v;
+                }
             }
         }
     }
@@ -229,7 +246,7 @@ pub(crate) fn pca_reduce(data: &Array2<f64>, n_dims: usize) -> Array2<f64> {
         }
     }
 
-    match cov.eigh(UPLO::Lower) {
+    match eigh(&cov) {
         Ok((eigenvalues, eigenvectors)) => {
             let eig_vec: Vec<f64> = eigenvalues.to_vec();
             let mut indices: Vec<usize> = (0..d).collect();
@@ -250,7 +267,10 @@ pub(crate) fn pca_reduce(data: &Array2<f64>, n_dims: usize) -> Array2<f64> {
 
             let var_explained: f64 = indices[..n_dims].iter().map(|&i| eig_vec[i]).sum();
             let var_total: f64 = eig_vec.iter().sum();
-            eprintln!("PCA: {:.1}% variance explained", 100.0 * var_explained / var_total);
+            eprintln!(
+                "PCA: {:.1}% variance explained",
+                100.0 * var_explained / var_total
+            );
 
             result
         }
@@ -292,7 +312,9 @@ pub(crate) fn pca_initialization(
             for k in j..n_dims {
                 let v = row[j] * row[k];
                 cov[[j, k]] += v;
-                if j != k { cov[[k, j]] += v; }
+                if j != k {
+                    cov[[k, j]] += v;
+                }
             }
         }
     }
@@ -305,7 +327,7 @@ pub(crate) fn pca_initialization(
 
     // Eigendecomposition of d×d covariance matrix
     let cov_clone: Array2<f64> = cov;
-    match cov_clone.eigh(UPLO::Lower) {
+    match eigh(&cov_clone) {
         Ok((eigenvalues, eigenvectors)) => {
             // Eigenvalues are in ascending order, we want the largest
             let eig_vec: Vec<f64> = eigenvalues.to_vec();
@@ -328,9 +350,12 @@ pub(crate) fn pca_initialization(
             // Scale to std dev = 1 per component (like uwot's init_sdev=1)
             for comp in 0..n_components {
                 let col_mean = embedding.column(comp).sum() / n_samples as f64;
-                let var: f64 = embedding.column(comp).iter()
+                let var: f64 = embedding
+                    .column(comp)
+                    .iter()
                     .map(|&x| (x - col_mean).powi(2))
-                    .sum::<f64>() / (n_samples as f64 - 1.0);
+                    .sum::<f64>()
+                    / (n_samples as f64 - 1.0);
                 let std = var.sqrt().max(1e-10);
                 for i in 0..n_samples {
                     embedding[[i, comp]] /= std;
@@ -351,8 +376,10 @@ pub(crate) fn pca_initialization(
                 }
             }
 
-            eprintln!("PCA init: top eigenvalues = [{:.4}, {:.4}]",
-                      eigenvalues[indices[0]], eigenvalues[indices[1]]);
+            eprintln!(
+                "PCA init: top eigenvalues = [{:.4}, {:.4}]",
+                eigenvalues[indices[0]], eigenvalues[indices[1]]
+            );
             embedding
         }
         Err(e) => {
@@ -369,9 +396,7 @@ fn compute_graph_laplacian(graph: &Array2<f64>) -> Array2<f64> {
     let mut laplacian = Array2::zeros((n, n));
 
     // Compute degree matrix
-    let degrees: Vec<f64> = (0..n)
-        .map(|i| graph.row(i).sum())
-        .collect();
+    let degrees: Vec<f64> = (0..n).map(|i| graph.row(i).sum()).collect();
 
     // L = D - A
     for i in 0..n {
@@ -400,11 +425,9 @@ mod tests {
 
     #[test]
     fn test_graph_laplacian() {
-        let graph = Array2::from_shape_vec((3, 3), vec![
-            0.0, 1.0, 0.0,
-            1.0, 0.0, 1.0,
-            0.0, 1.0, 0.0,
-        ]).unwrap();
+        let graph =
+            Array2::from_shape_vec((3, 3), vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0])
+                .unwrap();
 
         let laplacian = compute_graph_laplacian(&graph);
         assert_eq!(laplacian.shape(), &[3, 3]);

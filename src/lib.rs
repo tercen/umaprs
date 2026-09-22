@@ -1,27 +1,34 @@
 use ndarray::Array2;
 
-pub mod gpu;
 mod codebook;
 mod compressed;
+pub mod fuzzy;
+pub mod gpu;
 mod hnsw;
 mod kdtree;
 mod knn;
-mod fuzzy;
+pub mod linalg;
 mod model;
-mod quantize;
+mod optimize;
 mod quadtree;
+mod quantize;
 mod sparse;
 mod spectral;
-mod optimize;
 pub mod tsne;
 
-pub use knn::{compute_knn_graph, compute_knn_bruteforce, compute_knn_hnsw_f32};
 pub use fuzzy::compute_fuzzy_simplicial_set;
-pub use spectral::{spectral_layout, spectral_layout_with_data};
+pub use knn::{DEFAULT_EF_SEARCH, DEFAULT_REFINE, compute_knn_external, compute_knn_hnsw_tuned};
+pub use knn::{compute_knn_bruteforce, compute_knn_graph, compute_knn_hnsw_f32};
+pub use model::TransformStages;
+pub use model::{SamplingStrategy, UmapModel};
 pub use optimize::optimize_layout;
-pub use sparse::SparseGraph;
-pub use model::{UmapModel, SamplingStrategy};
+/// `umap-learn`'s curve fit for `a`, `b`; exposed so the fit can be checked against it.
+pub fn find_ab_params(min_dist: f64, spread: f64) -> (f64, f64) {
+    optimize::find_ab_params(min_dist, spread)
+}
 pub use quantize::{QuantBits, QuantizedData};
+pub use sparse::SparseGraph;
+pub use spectral::{spectral_layout, spectral_layout_with_data};
 
 /// Initialization method for the embedding
 #[derive(Clone, Debug)]
@@ -78,8 +85,29 @@ pub struct UMAP {
     /// Fraction of data to use for training (default: None = use all).
     /// When set (e.g., 0.1), fit on a random subset and transform the rest.
     pub train_size: Option<f64>,
+    /// Threads for the kNN, the fuzzy set, the SGD and the transform. `0` (the default) is
+    /// rayon's own choice, which honours the container's CPU quota. Every stage is either
+    /// deterministic by construction or seeded per unit of work, except the fit's HogWild SGD,
+    /// whose float summation order varies with the thread count: `threads = 1` is
+    /// bit-repeatable, any other value is repeatable up to that order -- the same contract as
+    /// umap-learn's parallel mode.
+    pub threads: usize,
     /// Sampling strategy for training subset (default: Random)
     pub sampling: SamplingStrategy,
+}
+
+/// Run `f` on a rayon pool of `threads` workers; 0 means the global pool. The fit and the
+/// model's `transform` both go through this, so `threads = 1` is sequential end to end.
+pub(crate) fn in_pool<T: Send>(threads: usize, f: impl FnOnce() -> T + Send) -> T {
+    if threads == 0 {
+        f()
+    } else {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("rayon pool")
+            .install(f)
+    }
 }
 
 impl Default for UMAP {
@@ -101,43 +129,113 @@ impl Default for UMAP {
             model_format: ModelFormat::None,
             feature_names: None,
             train_size: None,
+            threads: 0,
             sampling: SamplingStrategy::Random,
         }
     }
 }
 
 impl UMAP {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-    pub fn n_neighbors(mut self, v: usize) -> Self { self.n_neighbors = v; self }
-    pub fn n_components(mut self, v: usize) -> Self { self.n_components = v; self }
-    pub fn min_dist(mut self, v: f64) -> Self { self.min_dist = v; self }
-    pub fn spread(mut self, v: f64) -> Self { self.spread = v; self }
-    pub fn learning_rate(mut self, v: f64) -> Self { self.learning_rate = v; self }
-    pub fn n_epochs(mut self, v: usize) -> Self { self.n_epochs = v; self }
-    pub fn negative_sample_rate(mut self, v: f64) -> Self { self.negative_sample_rate = v; self }
-    pub fn repulsion_strength(mut self, v: f64) -> Self { self.repulsion_strength = v; self }
-    pub fn init(mut self, v: InitMethod) -> Self { self.init = v; self }
-    pub fn metric(mut self, v: Metric) -> Self { self.metric = v; self }
-    pub fn knn_method(mut self, v: KnnMethod) -> Self { self.knn_method = v; self }
-    pub fn pca(mut self, v: usize) -> Self { self.pca = Some(v); self }
-    pub fn random_state(mut self, v: u64) -> Self { self.random_state = Some(v); self }
-    pub fn model_format(mut self, v: ModelFormat) -> Self { self.model_format = v; self }
-    pub fn feature_names(mut self, v: Vec<String>) -> Self { self.feature_names = Some(v); self }
-    pub fn train_size(mut self, v: f64) -> Self { self.train_size = Some(v); self }
-    pub fn sampling(mut self, v: SamplingStrategy) -> Self { self.sampling = v; self }
+    pub fn n_neighbors(mut self, v: usize) -> Self {
+        self.n_neighbors = v;
+        self
+    }
+    pub fn n_components(mut self, v: usize) -> Self {
+        self.n_components = v;
+        self
+    }
+    pub fn min_dist(mut self, v: f64) -> Self {
+        self.min_dist = v;
+        self
+    }
+    pub fn spread(mut self, v: f64) -> Self {
+        self.spread = v;
+        self
+    }
+    pub fn learning_rate(mut self, v: f64) -> Self {
+        self.learning_rate = v;
+        self
+    }
+    pub fn n_epochs(mut self, v: usize) -> Self {
+        self.n_epochs = v;
+        self
+    }
+    pub fn negative_sample_rate(mut self, v: f64) -> Self {
+        self.negative_sample_rate = v;
+        self
+    }
+    pub fn repulsion_strength(mut self, v: f64) -> Self {
+        self.repulsion_strength = v;
+        self
+    }
+    pub fn init(mut self, v: InitMethod) -> Self {
+        self.init = v;
+        self
+    }
+    pub fn metric(mut self, v: Metric) -> Self {
+        self.metric = v;
+        self
+    }
+    pub fn knn_method(mut self, v: KnnMethod) -> Self {
+        self.knn_method = v;
+        self
+    }
+    pub fn pca(mut self, v: usize) -> Self {
+        self.pca = Some(v);
+        self
+    }
+    pub fn random_state(mut self, v: u64) -> Self {
+        self.random_state = Some(v);
+        self
+    }
+    /// Rayon threads for the fit and transform; 0 = all cores. `1` is bit-for-bit
+    /// reproducible run to run (HogWild SGD and the parallel HNSW build both depend on
+    /// scheduling otherwise).
+    pub fn threads(mut self, v: usize) -> Self {
+        self.threads = v;
+        self
+    }
+
+    pub fn model_format(mut self, v: ModelFormat) -> Self {
+        self.model_format = v;
+        self
+    }
+    pub fn feature_names(mut self, v: Vec<String>) -> Self {
+        self.feature_names = Some(v);
+        self
+    }
+    pub fn train_size(mut self, v: f64) -> Self {
+        self.train_size = Some(v);
+        self
+    }
+    pub fn sampling(mut self, v: SamplingStrategy) -> Self {
+        self.sampling = v;
+        self
+    }
 
     fn resolve_n_epochs(&self, n_samples: usize) -> usize {
-        if self.n_epochs > 0 { self.n_epochs }
-        else if n_samples < 10000 { 500 }
-        else { 200 }
+        if self.n_epochs > 0 {
+            self.n_epochs
+        } else if n_samples < 10000 {
+            500
+        } else {
+            200
+        }
     }
 
     fn find_ab_params(&self) -> (f64, f64) {
         optimize::find_ab_params(self.min_dist, self.spread)
     }
 
-    fn prepare_data<'a>(&self, data: &'a Array2<f64>, reduced: &'a mut Option<Array2<f64>>) -> &'a Array2<f64> {
+    fn prepare_data<'a>(
+        &self,
+        data: &'a Array2<f64>,
+        reduced: &'a mut Option<Array2<f64>>,
+    ) -> &'a Array2<f64> {
         if let Some(pca_dims) = self.pca {
             let n = data.nrows();
             let d = data.ncols();
@@ -151,12 +249,13 @@ impl UMAP {
     }
 
     fn compute_knn(&self, data: &Array2<f64>) -> Array2<usize> {
-        let k = self.n_neighbors;
+        // `n_neighbors` counts the point itself, as in umap-learn: ask for k - 1 others.
+        let k = self.n_neighbors.saturating_sub(1).max(1);
         match &self.knn_method {
-            KnnMethod::Auto => compute_knn_graph(data, k),
+            KnnMethod::Auto => compute_knn_graph(data, k, self.random_state.unwrap_or(42)),
             KnnMethod::BruteForce => compute_knn_bruteforce(data, k),
             KnnMethod::KdTree => knn::compute_knn_kdtree(data, k),
-            KnnMethod::Hnsw => compute_knn_hnsw_f32(data, k),
+            KnnMethod::Hnsw => compute_knn_hnsw_f32(data, k, self.random_state.unwrap_or(42)),
             KnnMethod::Gpu => gpu::compute_knn_gpu(data, k),
         }
     }
@@ -164,18 +263,27 @@ impl UMAP {
     /// Fit and return embedding only.
     /// If `train_size` is set, fits on a subset and transforms the rest.
     pub fn fit_transform(&self, data: &Array2<f64>) -> Array2<f64> {
+        self.in_pool(|| self.fit_transform_inner(data))
+    }
+
+    fn fit_transform_inner(&self, data: &Array2<f64>) -> Array2<f64> {
         let mut reduced = None;
         let work_data = self.prepare_data(data, &mut reduced);
 
         match self.train_size {
             Some(frac) if frac < 1.0 => {
                 let seed = self.random_state.unwrap_or(42);
-                let (train_idx, train_data) = UmapModel::sample_train(work_data, frac, &self.sampling, seed);
+                let (train_idx, train_data) =
+                    UmapModel::sample_train(work_data, frac, &self.sampling, seed);
                 let n_total = work_data.nrows();
                 let n_train = train_idx.len();
 
-                eprintln!("Training on {} / {} samples ({:.0}%), transforming the rest",
-                    n_train, n_total, frac * 100.0);
+                eprintln!(
+                    "Training on {} / {} samples ({:.0}%), transforming the rest",
+                    n_train,
+                    n_total,
+                    frac * 100.0
+                );
 
                 // Fit on training subset
                 let knn_indices = self.compute_knn(&train_data);
@@ -184,7 +292,9 @@ impl UMAP {
 
                 // Collect non-training indices
                 let mut is_train = vec![false; n_total];
-                for &i in &train_idx { is_train[i] = true; }
+                for &i in &train_idx {
+                    is_train[i] = true;
+                }
 
                 let rest_idx: Vec<usize> = (0..n_total).filter(|i| !is_train[*i]).collect();
 
@@ -217,7 +327,9 @@ impl UMAP {
 
                 // Save model if requested
                 if let ModelFormat::Csv(path) = &self.model_format {
-                    model.save_triples_csv(path).expect("Failed to save model CSV");
+                    model
+                        .save_triples_csv(path)
+                        .expect("Failed to save model CSV");
                     eprintln!("Model saved to: {}", path);
                 }
 
@@ -242,14 +354,22 @@ impl UMAP {
         let d = work_data.ncols();
         let n_epochs = self.resolve_n_epochs(n);
 
-        eprintln!("Compressed UMAP: {} points, {} dims, {:?} quantization", n, d, bits);
+        eprintln!(
+            "Compressed UMAP: {} points, {} dims, {:?} quantization",
+            n, d, bits
+        );
 
         // Step 1: Compress — after this, original data not needed
-        let qdata = QuantizedData::encode_with_bits(work_data, self.random_state.unwrap_or(42), bits);
+        let qdata =
+            QuantizedData::encode_with_bits(work_data, self.random_state.unwrap_or(42), bits);
         let original_mb = (n * d * 8) as f64 / 1024.0 / 1024.0;
         let compressed_mb = qdata.memory_bytes() as f64 / 1024.0 / 1024.0;
-        eprintln!("  Compressed: {:.1} MB -> {:.1} MB ({:.1}x)", original_mb, compressed_mb,
-                  original_mb / compressed_mb);
+        eprintln!(
+            "  Compressed: {:.1} MB -> {:.1} MB ({:.1}x)",
+            original_mb,
+            compressed_mb,
+            original_mb / compressed_mb
+        );
 
         // Step 2: kNN from compressed distances (no exact refinement)
         eprintln!("  kNN from compressed distances...");
@@ -262,7 +382,8 @@ impl UMAP {
 
         // Step 4: Initialize embedding (PCA on dequantized, streaming)
         eprintln!("  PCA initialization (streaming dequantize)...");
-        let mut embedding = compressed::pca_compressed(&qdata, self.n_components, self.random_state);
+        let mut embedding =
+            compressed::pca_compressed(&qdata, self.n_components, self.random_state);
 
         // Step 5: SGD optimization (only touches 2D embedding, no high-dim data)
         optimize_layout(
@@ -281,13 +402,25 @@ impl UMAP {
     }
 
     /// Fit using pre-computed kNN, return embedding only
-    pub fn fit_transform_with_knn(&self, data: &Array2<f64>, knn_indices: &Array2<usize>) -> Array2<f64> {
+    pub fn fit_transform_with_knn(
+        &self,
+        data: &Array2<f64>,
+        knn_indices: &Array2<usize>,
+    ) -> Array2<f64> {
         let (embedding, _) = self.fit_internal(data, knn_indices);
         embedding
     }
 
     /// Fit and return both embedding and model (for transform)
     pub fn fit(&self, data: &Array2<f64>) -> (Array2<f64>, UmapModel) {
+        self.in_pool(|| self.fit_inner(data))
+    }
+
+    fn in_pool<T: Send>(&self, f: impl FnOnce() -> T + Send) -> T {
+        in_pool(self.threads, f)
+    }
+
+    fn fit_inner(&self, data: &Array2<f64>) -> (Array2<f64>, UmapModel) {
         let mut reduced = None;
         let work_data = self.prepare_data(data, &mut reduced);
         let knn_indices = self.compute_knn(work_data);
@@ -297,28 +430,46 @@ impl UMAP {
 
         // Export if requested
         if let ModelFormat::Csv(path) = &self.model_format {
-            model.save_triples_csv(path).expect("Failed to save model CSV");
+            model
+                .save_triples_csv(path)
+                .expect("Failed to save model CSV");
             eprintln!("Model saved to: {}", path);
         }
 
         (embedding, model)
     }
 
-    fn fit_internal(&self, data: &Array2<f64>, knn_indices: &Array2<usize>) -> (Array2<f64>, Option<UmapModel>) {
+    fn fit_internal(
+        &self,
+        data: &Array2<f64>,
+        knn_indices: &Array2<usize>,
+    ) -> (Array2<f64>, Option<UmapModel>) {
         let n_samples = data.nrows();
         let n_epochs = self.resolve_n_epochs(n_samples);
         let (a, b) = self.find_ab_params();
 
         // Fuzzy simplicial set (with sigmas/rhos)
-        let fuzzy_result = fuzzy::compute_fuzzy_simplicial_set_full(knn_indices, data, self.n_neighbors);
+        let fuzzy_result =
+            fuzzy::compute_fuzzy_simplicial_set_full(knn_indices, data, self.n_neighbors);
 
         // Initialize embedding
         let mut embedding = match &self.init {
-            InitMethod::Spectral => spectral_layout(&fuzzy_result.graph, self.n_components, self.random_state),
-            InitMethod::Pca => spectral::pca_initialization(data, self.n_components, self.random_state),
-            InitMethod::Random => spectral::random_initialization(fuzzy_result.graph.n_nodes, self.n_components, self.random_state),
+            InitMethod::Spectral => {
+                spectral_layout(&fuzzy_result.graph, self.n_components, self.random_state)
+            }
+            InitMethod::Pca => {
+                spectral::pca_initialization(data, self.n_components, self.random_state)
+            }
+            InitMethod::Random => spectral::random_initialization(
+                fuzzy_result.graph.n_nodes,
+                self.n_components,
+                self.random_state,
+            ),
             InitMethod::Auto => spectral_layout_with_data(
-                &fuzzy_result.graph, self.n_components, self.random_state, Some(data),
+                &fuzzy_result.graph,
+                self.n_components,
+                self.random_state,
+                Some(data),
             ),
         };
 
@@ -345,6 +496,12 @@ impl UMAP {
             b,
             n_neighbors: self.n_neighbors,
             feature_names: self.feature_names.clone(),
+            n_epochs: self.n_epochs,
+            learning_rate: self.learning_rate,
+            negative_sample_rate: self.negative_sample_rate,
+            repulsion_strength: self.repulsion_strength,
+            transform_seed: self.random_state.unwrap_or(42),
+            threads: self.threads,
         };
 
         (embedding, Some(model))
@@ -397,7 +554,8 @@ mod tests {
         let (_, model) = umap.fit(&data);
 
         // Transform new data
-        let new_data = Array2::from_shape_vec((5, 4), (0..20).map(|x| x as f64 + 0.5).collect()).unwrap();
+        let new_data =
+            Array2::from_shape_vec((5, 4), (0..20).map(|x| x as f64 + 0.5).collect()).unwrap();
         let new_emb = model.transform(&new_data);
         assert_eq!(new_emb.shape(), &[5, 2]);
     }

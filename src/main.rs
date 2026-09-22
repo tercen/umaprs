@@ -38,7 +38,12 @@ fn main() {
     println!("Output embedding shape: {:?}", embedding.shape());
     println!("\nFirst 5 embedded points:");
     for i in 0..5.min(embedding.nrows()) {
-        println!("  Point {}: [{:.3}, {:.3}]", i, embedding[[i, 0]], embedding[[i, 1]]);
+        println!(
+            "  Point {}: [{:.3}, {:.3}]",
+            i,
+            embedding[[i, 0]],
+            embedding[[i, 1]]
+        );
     }
 
     println!("\nUMAP dimensionality reduction completed!");

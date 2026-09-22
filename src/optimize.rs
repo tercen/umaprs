@@ -1,29 +1,100 @@
 use ndarray::Array2;
-use rand::prelude::*;
 use rand::SeedableRng;
-use rand::rngs::{StdRng, SmallRng};
+use rand::prelude::*;
+use rand::rngs::{SmallRng, StdRng};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::sparse::SparseGraph;
 
-/// Fit the UMAP curve parameters a and b from min_dist and spread
+/// Fit the curve parameters `a`, `b` from `min_dist` and `spread` — `umap-learn`'s
+/// `find_ab_params`, not a table.
+///
+/// The target is the piecewise curve `y = 1` for `x < min_dist`, `exp(-(x - min_dist)/spread)`
+/// after, sampled at 300 points on `[0, 3·spread]`, and `1 / (1 + a·x^(2b))` is fitted to it
+/// by Levenberg–Marquardt from `(1, 1)`, which is what `scipy.optimize.curve_fit` does with
+/// its defaults. The table this replaces was exact at 0.1, off by 1.8% / 1.1% at 0.01, and by
+/// 92% / 20% at 0.5 — the R operator's default.
 pub(crate) fn find_ab_params(min_dist: f64, spread: f64) -> (f64, f64) {
-    if (min_dist - 0.1).abs() < 1e-6 && (spread - 1.0).abs() < 1e-6 {
-        return (1.577, 0.8951);
-    }
-    if (min_dist - 0.01).abs() < 1e-6 && (spread - 1.0).abs() < 1e-6 {
-        return (1.929, 0.7915);
-    }
-    if (min_dist - 0.5).abs() < 1e-6 && (spread - 1.0).abs() < 1e-6 {
-        return (1.120, 1.068);
-    }
-    let a = if min_dist > 0.0 {
-        (1.0 / 0.4 - 1.0) / spread.powf(2.0 * 0.9)
-    } else {
-        1.577
+    const N: usize = 300;
+    let xs: Vec<f64> = (0..N)
+        .map(|i| spread * 3.0 * i as f64 / (N - 1) as f64)
+        .collect();
+    let ys: Vec<f64> = xs
+        .iter()
+        .map(|&x| {
+            if x < min_dist {
+                1.0
+            } else {
+                (-(x - min_dist) / spread).exp()
+            }
+        })
+        .collect();
+
+    let model = |a: f64, b: f64, x: f64| -> f64 { 1.0 / (1.0 + a * x.powf(2.0 * b)) };
+    let (mut a, mut b) = (1.0f64, 1.0f64);
+    let mut lambda = 1e-3;
+    let mut cost = |a: f64, b: f64| -> f64 {
+        xs.iter()
+            .zip(&ys)
+            .map(|(&x, &y)| (model(a, b, x) - y).powi(2))
+            .sum::<f64>()
     };
-    (a, 0.9)
+    let mut current = cost(a, b);
+    for _ in 0..200 {
+        // J^T J and J^T r with the analytic Jacobian.
+        let (mut jtj00, mut jtj01, mut jtj11, mut jtr0, mut jtr1) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        for (&x, &y) in xs.iter().zip(&ys) {
+            let x2b = if x > 0.0 { x.powf(2.0 * b) } else { 0.0 };
+            let denom = 1.0 + a * x2b;
+            let f = 1.0 / denom;
+            let r = f - y;
+            let dfa = -x2b / (denom * denom);
+            let dfb = if x > 0.0 {
+                -2.0 * a * x2b * x.ln() / (denom * denom)
+            } else {
+                0.0
+            };
+            jtj00 += dfa * dfa;
+            jtj01 += dfa * dfb;
+            jtj11 += dfb * dfb;
+            jtr0 += dfa * r;
+            jtr1 += dfb * r;
+        }
+        // Solve (J^T J + λ diag) δ = -J^T r; accept if the cost drops, else raise λ.
+        let mut accepted = false;
+        for _ in 0..20 {
+            let m00 = jtj00 * (1.0 + lambda);
+            let m11 = jtj11 * (1.0 + lambda);
+            let det = m00 * m11 - jtj01 * jtj01;
+            if det.abs() < 1e-300 {
+                break;
+            }
+            let da = (-jtr0 * m11 + jtr1 * jtj01) / det;
+            let db = (-jtr1 * m00 + jtr0 * jtj01) / det;
+            let (na, nb) = (a + da, b + db);
+            let c = cost(na, nb);
+            if c < current {
+                let converged = (da.abs() < 1e-10 * (1.0 + a.abs())
+                    && db.abs() < 1e-10 * (1.0 + b.abs()))
+                    || (current - c) < 1e-15 * current;
+                a = na;
+                b = nb;
+                current = c;
+                lambda = (lambda / 10.0).max(1e-12);
+                accepted = true;
+                if converged {
+                    return (a, b);
+                }
+                break;
+            }
+            lambda *= 10.0;
+        }
+        if !accepted {
+            break;
+        }
+    }
+    (a, b)
 }
 
 const GRAD_CLAMP_HI: f32 = 4.0;
@@ -32,9 +103,13 @@ const GRAD_CLAMP_LO: f32 = -4.0;
 #[inline(always)]
 fn clamp_grad(val: f32) -> f32 {
     // branchless clamp
-    if val > GRAD_CLAMP_HI { GRAD_CLAMP_HI }
-    else if val < GRAD_CLAMP_LO { GRAD_CLAMP_LO }
-    else { val }
+    if val > GRAD_CLAMP_HI {
+        GRAD_CLAMP_HI
+    } else if val < GRAD_CLAMP_LO {
+        GRAD_CLAMP_LO
+    } else {
+        val
+    }
 }
 
 /// Epoch-based edge sampler matching uwot's Sampler class.
@@ -113,7 +188,10 @@ pub fn optimize_layout(
 ) {
     let n_samples = embedding.nrows();
     let n_components = embedding.ncols();
-    assert_eq!(n_components, 2, "Only 2D embedding supported for optimized path");
+    assert_eq!(
+        n_components, 2,
+        "Only 2D embedding supported for optimized path"
+    );
 
     let (a_f64, b_f64) = find_ab_params(min_dist, spread);
     let a = a_f64 as f32;
@@ -143,25 +221,6 @@ pub fn optimize_layout(
 
     // Fast approximate pow matching uwot's fastPrecisePow
     #[inline(always)]
-    fn fast_pow(a: f32, b: f32) -> f32 {
-        let e = b as i32;
-        let frac = b - e as f32;
-        let u: f64 = a as f64;
-        let bits = u.to_bits() as i64;
-        let approx_bits = (frac as f64 * (bits - 4606853616395542528) as f64
-            + 4606853616395542528.0) as u64;
-        let approx = f64::from_bits(approx_bits);
-        let mut r = 1.0f64;
-        let mut base = a as f64;
-        let mut exp = if e >= 0 { e } else { -e };
-        while exp > 0 {
-            if exp & 1 == 1 { r *= base; }
-            base *= base;
-            exp >>= 1;
-        }
-        if e >= 0 { (r * approx) as f32 } else { (approx / r) as f32 }
-    }
-
     // Atomic f32 helpers for HogWild! parallel SGD
     #[inline(always)]
     fn atomic_add_f32(atom: &AtomicU32, val: f32) {
@@ -208,54 +267,63 @@ pub fn optimize_layout(
         }
 
         // Process in parallel with per-thread SmallRng (fast, no StdRng per edge)
-        let epoch_seed = random_state.unwrap_or(42).wrapping_add(epoch as u64 * 1000003);
-        active_edges.par_chunks(256).enumerate().for_each(|(chunk_idx, chunk)| {
-            let mut local_rng = SmallRng::seed_from_u64(epoch_seed.wrapping_add(chunk_idx as u64 * 999983));
+        let epoch_seed = random_state
+            .unwrap_or(42)
+            .wrapping_add(epoch as u64 * 1000003);
+        active_edges
+            .par_chunks(256)
+            .enumerate()
+            .for_each(|(chunk_idx, chunk)| {
+                let mut local_rng =
+                    SmallRng::seed_from_u64(epoch_seed.wrapping_add(chunk_idx as u64 * 999983));
 
-            for &(edge, n_neg) in chunk {
-                let i = unsafe { *heads.get_unchecked(edge) } as usize;
-                let j = unsafe { *tails.get_unchecked(edge) } as usize;
-                let i2 = i * 2;
-                let j2 = j * 2;
+                for &(edge, n_neg) in chunk {
+                    let i = unsafe { *heads.get_unchecked(edge) } as usize;
+                    let j = unsafe { *tails.get_unchecked(edge) } as usize;
+                    let i2 = i * 2;
+                    let j2 = j * 2;
 
-                let ix = atomic_load_f32(&emb[i2]);
-                let iy = atomic_load_f32(&emb[i2 + 1]);
-                let jx = atomic_load_f32(&emb[j2]);
-                let jy = atomic_load_f32(&emb[j2 + 1]);
+                    let ix = atomic_load_f32(&emb[i2]);
+                    let iy = atomic_load_f32(&emb[i2 + 1]);
+                    let jx = atomic_load_f32(&emb[j2]);
+                    let jy = atomic_load_f32(&emb[j2 + 1]);
 
-                let dx = ix - jx;
-                let dy = iy - jy;
-                let dist_sq = (dx * dx + dy * dy).max(f32::EPSILON);
+                    let dx = ix - jx;
+                    let dy = iy - jy;
+                    let dist_sq = (dx * dx + dy * dy).max(f32::EPSILON);
 
-                let pd2b = fast_pow(dist_sq, b);
-                let attr_coeff = (a_b_m2 * pd2b) / (dist_sq * (a * pd2b + 1.0));
+                    let pd2b = dist_sq.powf(b);
+                    let attr_coeff = (a_b_m2 * pd2b) / (dist_sq * (a * pd2b + 1.0));
 
-                let ux = alpha * clamp_grad(attr_coeff * dx);
-                let uy = alpha * clamp_grad(attr_coeff * dy);
+                    let ux = alpha * clamp_grad(attr_coeff * dx);
+                    let uy = alpha * clamp_grad(attr_coeff * dy);
 
-                atomic_add_f32(&emb[i2], ux);
-                atomic_add_f32(&emb[i2 + 1], uy);
-                atomic_add_f32(&emb[j2], -ux);
-                atomic_add_f32(&emb[j2 + 1], -uy);
+                    atomic_add_f32(&emb[i2], ux);
+                    atomic_add_f32(&emb[i2 + 1], uy);
+                    atomic_add_f32(&emb[j2], -ux);
+                    atomic_add_f32(&emb[j2 + 1], -uy);
 
-                for _ in 0..n_neg {
-                    let neg = local_rng.gen_range(0..n_samples_u32) as usize;
-                    if neg == i { continue; }
+                    for _ in 0..n_neg {
+                        let neg = local_rng.gen_range(0..n_samples_u32) as usize;
+                        if neg == i {
+                            continue;
+                        }
 
-                    let n2 = neg * 2;
-                    let nx = atomic_load_f32(&emb[n2]);
-                    let ny = atomic_load_f32(&emb[n2 + 1]);
-                    let ndx = ix - nx;
-                    let ndy = iy - ny;
-                    let ndist_sq = (ndx * ndx + ndy * ndy).max(f32::EPSILON);
+                        let n2 = neg * 2;
+                        let nx = atomic_load_f32(&emb[n2]);
+                        let ny = atomic_load_f32(&emb[n2 + 1]);
+                        let ndx = ix - nx;
+                        let ndy = iy - ny;
+                        let ndist_sq = (ndx * ndx + ndy * ndy).max(f32::EPSILON);
 
-                    let rep_coeff = gamma_b_2 / ((0.001 + ndist_sq) * (a * fast_pow(ndist_sq, b) + 1.0));
+                        let rep_coeff =
+                            gamma_b_2 / ((0.001 + ndist_sq) * (a * ndist_sq.powf(b) + 1.0));
 
-                    atomic_add_f32(&emb[i2], alpha * clamp_grad(rep_coeff * ndx));
-                    atomic_add_f32(&emb[i2 + 1], alpha * clamp_grad(rep_coeff * ndy));
+                        atomic_add_f32(&emb[i2], alpha * clamp_grad(rep_coeff * ndx));
+                        atomic_add_f32(&emb[i2 + 1], alpha * clamp_grad(rep_coeff * ndy));
+                    }
                 }
-            }
-        });
+            });
     }
 
     // Center and convert back to f64
@@ -295,20 +363,28 @@ mod tests {
 
     #[test]
     fn test_optimize_layout() {
-        let mut embedding = Array2::from_shape_vec((5, 2), vec![
-            0.0, 0.0,
-            1.0, 0.0,
-            0.0, 1.0,
-            1.0, 1.0,
-            0.5, 0.5,
-        ]).unwrap();
+        let mut embedding = Array2::from_shape_vec(
+            (5, 2),
+            vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.5, 0.5],
+        )
+        .unwrap();
 
         let rows = vec![0, 1, 2, 3];
         let cols = vec![1, 2, 3, 4];
         let vals = vec![1.0, 1.0, 1.0, 1.0];
         let graph = SparseGraph::from_triplets(5, &rows, &cols, &vals);
 
-        optimize_layout(&mut embedding, &graph, 10, 1.0, 0.1, 1.0, 5.0, 1.0, Some(42));
+        optimize_layout(
+            &mut embedding,
+            &graph,
+            10,
+            1.0,
+            0.1,
+            1.0,
+            5.0,
+            1.0,
+            Some(42),
+        );
         assert_eq!(embedding.shape(), &[5, 2]);
 
         let mean_x: f64 = embedding.column(0).mean().unwrap();
@@ -322,5 +398,55 @@ mod tests {
         let weights = vec![1.0f32, 0.5, 0.25];
         let sampler = Sampler::new(&weights, 5.0);
         assert!(sampler.is_sample_edge(0, 1.0));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn fast_pow_legacy_probe(a: f32, b: f32) -> f32 {
+    // the original body, verbatim
+    let e = b as i32;
+    let frac = b - e as f32;
+    let u: f64 = a as f64;
+    let bits = u.to_bits() as i64;
+    let approx_bits =
+        (frac as f64 * (bits - 4606853616395542528) as f64 + 4606853616395542528.0) as u64;
+    let approx = f64::from_bits(approx_bits);
+    let mut r = 1.0f64;
+    let mut base = a as f64;
+    let mut exp = if e >= 0 { e } else { -e };
+    while exp > 0 {
+        if exp & 1 == 1 {
+            r *= base;
+        }
+        base *= base;
+        exp >>= 1;
+    }
+    if e >= 0 {
+        (r * approx) as f32
+    } else {
+        (approx / r) as f32
+    }
+}
+
+#[cfg(test)]
+mod pow_tests {
+    /// What the old approximation cost, in one number: its worst relative error over the
+    /// squared distances the gradient sees, at the curve exponent for min_dist = 0.01.
+    #[test]
+    fn the_legacy_fast_pow_was_percent_level_wrong() {
+        let b = 0.8006f32;
+        let mut worst = 0.0f32;
+        let mut x = 1e-7f32;
+        while x < 1e4 {
+            let exact = x.powf(b);
+            let approx = super::fast_pow_legacy_probe(x, b);
+            worst = worst.max(((approx - exact) / exact).abs());
+            x *= 1.05;
+        }
+        assert!(
+            worst > 1e-2,
+            "expected percent-level error, measured {worst:.3e}"
+        );
+        eprintln!("legacy fast_pow worst relative error at b = {b}: {worst:.3e}");
     }
 }

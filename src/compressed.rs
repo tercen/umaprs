@@ -7,12 +7,11 @@
 ///   3. Fuzzy simplicial set from compressed distances (sigma/rho from TQ distances)
 ///   4. Spectral/PCA init (uses compressed data dequantized on-the-fly)
 ///   5. SGD optimization (operates on 2D embedding, no high-dim data needed)
-
 use ndarray::Array2;
 use rayon::prelude::*;
 use std::collections::HashMap;
 
-use crate::quantize::{QuantizedData, QuantBits};
+use crate::quantize::{QuantBits, QuantizedData};
 use crate::sparse::SparseGraph;
 
 /// Compute kNN entirely from compressed distances. No exact refinement.
@@ -89,7 +88,9 @@ pub fn fuzzy_compressed(
     // Symmetrize: a + b - a*b
     let mut symmetric: HashMap<(usize, usize), f64> = HashMap::new();
     for (&(i, j), &a) in &directed {
-        if symmetric.contains_key(&(i, j)) { continue; }
+        if symmetric.contains_key(&(i, j)) {
+            continue;
+        }
         let b = directed.get(&(j, i)).copied().unwrap_or(0.0);
         let val = a + b - a * b;
         if val > 1e-8 {
@@ -124,8 +125,14 @@ fn smooth_knn_distances(distances: &[f64], target: f64) -> (f64, f64) {
         for &d in distances.iter().skip(1) {
             val += (-((d - rho).max(0.0) / mid)).exp();
         }
-        if (val - target).abs() < 1e-5 { break; }
-        if val > target { hi = mid; } else { lo = mid; }
+        if (val - target).abs() < 1e-5 {
+            break;
+        }
+        if val > target {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
     }
 
     (rho, mid)
@@ -138,9 +145,9 @@ pub fn pca_compressed(
     n_components: usize,
     random_state: Option<u64>,
 ) -> Array2<f64> {
+    use ndarray_rand::rand_distr::{Distribution, StandardNormal};
     use rand::SeedableRng;
     use rand::rngs::StdRng;
-    use ndarray_rand::rand_distr::{StandardNormal, Distribution};
 
     let n = qdata.n_samples;
     let d = qdata.n_dims;
@@ -153,7 +160,9 @@ pub fn pca_compressed(
             means[j] += decoded[j] as f64;
         }
     }
-    for m in means.iter_mut() { *m /= n as f64; }
+    for m in means.iter_mut() {
+        *m /= n as f64;
+    }
 
     // Covariance matrix (d×d) — stream through dequantized vectors
     let mut cov = vec![0.0f64; d * d];
@@ -165,18 +174,20 @@ pub fn pca_compressed(
                 let vk = decoded[k] as f64 - means[k];
                 let val = vj * vk;
                 cov[j * d + k] += val;
-                if j != k { cov[k * d + j] += val; }
+                if j != k {
+                    cov[k * d + j] += val;
+                }
             }
         }
     }
     let inv_n = 1.0 / (n as f64 - 1.0);
-    for v in cov.iter_mut() { *v *= inv_n; }
+    for v in cov.iter_mut() {
+        *v *= inv_n;
+    }
 
     // Eigendecomposition of d×d covariance
     let cov_arr = Array2::from_shape_vec((d, d), cov).unwrap();
-    use ndarray_linalg::{Eigh, UPLO};
-
-    match cov_arr.eigh(UPLO::Lower) {
+    match crate::linalg::eigh(&cov_arr) {
         Ok((eigenvalues, eigenvectors)) => {
             let eig_vec: Vec<f64> = eigenvalues.to_vec();
             let mut indices: Vec<usize> = (0..d).collect();
@@ -199,9 +210,12 @@ pub fn pca_compressed(
             // Scale to std dev = 1
             for comp in 0..n_components {
                 let col_mean = embedding.column(comp).sum() / n as f64;
-                let var: f64 = embedding.column(comp).iter()
+                let var: f64 = embedding
+                    .column(comp)
+                    .iter()
                     .map(|&x| (x - col_mean).powi(2))
-                    .sum::<f64>() / (n as f64 - 1.0);
+                    .sum::<f64>()
+                    / (n as f64 - 1.0);
                 let std = var.sqrt().max(1e-10);
                 for i in 0..n {
                     embedding[[i, comp]] /= std;
@@ -240,10 +254,14 @@ mod tests {
         // Small test: 20 points, 16 dims, two clusters
         let mut data_vec = vec![0.0f64; 20 * 16];
         for i in 0..10 {
-            for j in 0..8 { data_vec[i * 16 + j] = 10.0 + i as f64 * 0.5; }
+            for j in 0..8 {
+                data_vec[i * 16 + j] = 10.0 + i as f64 * 0.5;
+            }
         }
         for i in 10..20 {
-            for j in 8..16 { data_vec[i * 16 + j] = 10.0 + i as f64 * 0.5; }
+            for j in 8..16 {
+                data_vec[i * 16 + j] = 10.0 + i as f64 * 0.5;
+            }
         }
         let data = Array2::from_shape_vec((20, 16), data_vec).unwrap();
 

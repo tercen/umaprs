@@ -1,8 +1,9 @@
 use ndarray::Array2;
-use rayon::prelude::*;
+use rand::RngCore;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use rand::seq::SliceRandom;
+use rayon::prelude::*;
 use std::collections::HashMap;
 
 use crate::kdtree::KdTree;
@@ -47,6 +48,28 @@ pub struct UmapModel {
     pub n_neighbors: usize,
     /// Feature names (optional)
     pub feature_names: Option<Vec<String>>,
+    /// What the fit was run with, because the transform derives its own schedule from them.
+    pub n_epochs: usize,
+    pub learning_rate: f64,
+    pub negative_sample_rate: f64,
+    pub repulsion_strength: f64,
+    /// Seed for the transform's negative sampling. `umap-learn`'s `transform_seed`, default 42.
+    pub transform_seed: u64,
+    /// Thread count the model was fitted with; `transform` uses the same (0 = global pool).
+    pub threads: usize,
+}
+
+/// The transform's intermediate stages, exposed so each can be checked against `umap-learn`.
+pub struct TransformStages {
+    /// `n_new × k` neighbours among the training points, and their distances
+    pub knn_indices: Array2<usize>,
+    pub knn_dists: Array2<f64>,
+    pub sigmas: Vec<f64>,
+    pub rhos: Vec<f64>,
+    /// bipartite memberships, `n_new × k` in row-major order
+    pub memberships: Vec<f64>,
+    /// the weighted-mean initial positions, `n_new × n_components`
+    pub init: Array2<f64>,
 }
 
 impl UmapModel {
@@ -83,8 +106,31 @@ impl UmapModel {
         (indices, train)
     }
 
-    /// Transform new data points onto the existing embedding.
-    pub fn transform(&self, new_data: &Array2<f64>) -> Array2<f64> {
+    /// The epoch count `umap-learn` uses for a transform: 100 for a small batch, 30 for a
+    /// large one, or a third of the fit's when that was given explicitly.
+    pub fn transform_epochs(&self, n_new: usize) -> usize {
+        if self.n_epochs > 0 {
+            (self.n_epochs / 3).max(1)
+        } else if n_new <= 10_000 {
+            100
+        } else {
+            30
+        }
+    }
+
+    /// Everything before the optimisation — `umap-learn`'s `transform` up to
+    /// `init_graph_transform`.
+    ///
+    /// `smooth_knn_dist` is run with `local_connectivity - 1 = 0`, which makes ρ = 0 for every
+    /// query: a query is not its own neighbour, so the local-connectivity offset does not
+    /// apply. The σ sum skips column 0 — the nearest training point — because the function
+    /// is written for rows whose column 0 is self. That is a quirk of the reference, copied so
+    /// the projection is the one `umap-learn` users see.
+    pub fn transform_stages(&self, new_data: &Array2<f64>) -> TransformStages {
+        crate::in_pool(self.threads, || self.transform_stages_inner(new_data))
+    }
+
+    fn transform_stages_inner(&self, new_data: &Array2<f64>) -> TransformStages {
         let expected_dims = self.training_data.ncols();
         if new_data.ncols() != expected_dims {
             let feat_info = match &self.feature_names {
@@ -93,104 +139,172 @@ impl UmapModel {
             };
             panic!(
                 "Input has {} features but model expects {}{}",
-                new_data.ncols(), expected_dims, feat_info
+                new_data.ncols(),
+                expected_dims,
+                feat_info
             );
         }
-
         let n_new = new_data.nrows();
-        let n_dims = new_data.ncols();
+        let k = self.n_neighbors.min(self.training_data.nrows());
         let n_components = self.embedding.ncols();
+
+        let (knn_indices, knn_dists) =
+            crate::knn::compute_knn_external(&self.training_data, new_data, k, self.transform_seed);
+        let dists_flat: Vec<f64> = knn_dists.iter().copied().collect();
+        let inds_flat: Vec<usize> = knn_indices.iter().copied().collect();
+        let (sigmas, rhos) = crate::fuzzy::smooth_knn_dist(&dists_flat, n_new, k, 0.0);
+        let (_, _, memberships) = crate::fuzzy::compute_membership_strengths(
+            &inds_flat,
+            &dists_flat,
+            n_new,
+            k,
+            &sigmas,
+            &rhos,
+            true,
+        );
+
+        // `init_graph_transform`: the membership-weighted mean of the neighbours' positions.
+        let mut init = Array2::zeros((n_new, n_components));
+        for i in 0..n_new {
+            let w = &memberships[i * k..(i + 1) * k];
+            let wsum: f64 = w.iter().sum();
+            if wsum > 0.0 {
+                for j in 0..k {
+                    let nb = inds_flat[i * k + j];
+                    for c in 0..n_components {
+                        init[[i, c]] += w[j] / wsum * self.embedding[[nb, c]];
+                    }
+                }
+            } else {
+                for c in 0..n_components {
+                    init[[i, c]] = f64::NAN;
+                }
+            }
+        }
+        TransformStages {
+            knn_indices,
+            knn_dists,
+            sigmas,
+            rhos,
+            memberships,
+            init,
+        }
+    }
+
+    /// Transform new data points onto the existing embedding — `umap-learn`'s `transform`.
+    ///
+    /// After [`transform_stages`], the new points are optimised against the **fixed** training
+    /// embedding: attraction along their membership edges, repulsion from negative samples
+    /// drawn among the training points, learning rate a quarter of the fit's, the usual
+    /// `epochs_per_sample` schedule with edges below `max / n_epochs` pruned first. Only the
+    /// new point moves (`move_other = false`), so every new point is independent of every
+    /// other: the loop is parallel over points with one RNG each, seeded from
+    /// `transform_seed` and the point's index, and is therefore deterministic at any thread
+    /// count.
+    pub fn transform(&self, new_data: &Array2<f64>) -> Array2<f64> {
+        crate::in_pool(self.threads, || self.transform_inner(new_data))
+    }
+
+    fn transform_inner(&self, new_data: &Array2<f64>) -> Array2<f64> {
+        let st = self.transform_stages_inner(new_data);
+        let n_new = new_data.nrows();
         let n_train = self.training_data.nrows();
-        let k = self.n_neighbors;
+        let k = self.n_neighbors.min(n_train);
+        let n_components = self.embedding.ncols();
+        let n_epochs = self.transform_epochs(n_new);
 
-        // Build kd-tree on training data
-        let flat: Vec<f32> = self.training_data.iter().map(|&v| v as f32).collect();
-        let tree = KdTree::build(&flat, n_train, n_dims);
-
-        let query_flat: Vec<f32> = new_data.iter().map(|&v| v as f32).collect();
-
+        // Prune, then the schedule, both as `umap-learn` does them.
+        let max_w = st.memberships.iter().cloned().fold(0.0f64, f64::max);
+        let threshold = max_w / n_epochs as f64;
+        let eps: Vec<f32> = st
+            .memberships
+            .iter()
+            .map(|&w| {
+                if w < threshold || w <= 0.0 {
+                    f32::INFINITY
+                } else {
+                    (max_w / w) as f32
+                }
+            })
+            .collect();
+        let neg_rate = self.negative_sample_rate as f32;
         let a = self.a as f32;
         let b = self.b as f32;
+        let gamma = self.repulsion_strength as f32;
+        let initial_alpha = (self.learning_rate / 4.0) as f32;
+        let train: Vec<f32> = self.embedding.iter().map(|&v| v as f32).collect();
+        let seed = self.transform_seed;
 
-        let results: Vec<Vec<f64>> = (0..n_new)
+        let rows: Vec<Vec<f32>> = (0..n_new)
             .into_par_iter()
-            .map(|qi| {
-                let q_slice = &query_flat[qi * n_dims..(qi + 1) * n_dims];
-
-                // Find k nearest neighbors in training data via brute scan
-                // (kd-tree.knn needs internal index; for external queries use direct scan)
-                let mut dists: Vec<(usize, f32)> = (0..n_train)
-                    .map(|ti| {
-                        let t_slice = &flat[ti * n_dims..(ti + 1) * n_dims];
-                        let d: f32 = q_slice.iter().zip(t_slice.iter())
-                            .map(|(a, b)| (a - b) * (a - b))
-                            .sum();
-                        (ti, d)
-                    })
-                    .collect();
-
-                dists.select_nth_unstable_by(k, |a, b| a.1.partial_cmp(&b.1).unwrap());
-                dists.truncate(k);
-                dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-
-                let nn_dists: Vec<f64> = dists.iter().map(|&(_, d)| (d as f64).sqrt()).collect();
-                let nn_indices: Vec<usize> = dists.iter().map(|&(i, _)| i).collect();
-
-                // Fuzzy weights
-                let rho = nn_dists[0].max(0.0);
-                let sigma: f64 = nn_indices.iter()
-                    .map(|&i| self.sigmas[i])
-                    .sum::<f64>() / k as f64;
-
-                let mut weights = Vec::with_capacity(k);
-                for &d in &nn_dists {
-                    weights.push((-((d - rho).max(0.0) / sigma.max(1e-10))).exp());
+            .map(|i| {
+                let mut cur: Vec<f32> = (0..n_components).map(|c| st.init[[i, c]] as f32).collect();
+                if cur.iter().any(|v| v.is_nan()) {
+                    return cur;
                 }
-
-                // Initialize as weighted average of neighbor embeddings
-                let weight_sum: f64 = weights.iter().sum();
-                let mut pos = vec![0.0f64; n_components];
-                for (&ni, &w) in nn_indices.iter().zip(weights.iter()) {
-                    for c in 0..n_components {
-                        pos[c] += w * self.embedding[[ni, c]];
+                let mut rng =
+                    SmallRng::seed_from_u64(seed ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                let my_eps = &eps[i * k..(i + 1) * k];
+                let mut next_sample: Vec<f32> = my_eps.to_vec();
+                let epns: Vec<f32> = my_eps.iter().map(|e| e / neg_rate).collect();
+                let mut next_neg: Vec<f32> = epns.clone();
+                let mut other = vec![0.0f32; n_components];
+                for n in 0..n_epochs {
+                    let alpha = initial_alpha * (1.0 - n as f32 / n_epochs as f32);
+                    let nf = n as f32;
+                    for e in 0..k {
+                        if next_sample[e] > nf {
+                            continue;
+                        }
+                        let nb = st.knn_indices[[i, e]];
+                        for c in 0..n_components {
+                            other[c] = train[nb * n_components + c];
+                        }
+                        let dist_sq: f32 =
+                            cur.iter().zip(&other).map(|(x, y)| (x - y) * (x - y)).sum();
+                        let grad_coeff = if dist_sq > 0.0 {
+                            (-2.0 * a * b * dist_sq.powf(b - 1.0)) / (a * dist_sq.powf(b) + 1.0)
+                        } else {
+                            0.0
+                        };
+                        for c in 0..n_components {
+                            cur[c] += clip(grad_coeff * (cur[c] - other[c])) * alpha;
+                        }
+                        next_sample[e] += my_eps[e];
+                        let n_neg = ((nf - next_neg[e]) / epns[e]) as i64;
+                        for _ in 0..n_neg.max(0) {
+                            let kk = (rng.next_u32() as usize) % n_train;
+                            for c in 0..n_components {
+                                other[c] = train[kk * n_components + c];
+                            }
+                            let dist_sq: f32 =
+                                cur.iter().zip(&other).map(|(x, y)| (x - y) * (x - y)).sum();
+                            let grad_coeff = if dist_sq > 0.0 {
+                                (2.0 * gamma * b)
+                                    / ((0.001 + dist_sq) * (a * dist_sq.powf(b) + 1.0))
+                            } else {
+                                0.0
+                            };
+                            for c in 0..n_components {
+                                let g = if grad_coeff > 0.0 {
+                                    clip(grad_coeff * (cur[c] - other[c]))
+                                } else {
+                                    4.0
+                                };
+                                cur[c] += g * alpha;
+                            }
+                        }
+                        next_neg[e] += n_neg.max(0) as f32 * epns[e];
                     }
                 }
-                for c in 0..n_components {
-                    pos[c] /= weight_sum.max(1e-10);
-                }
-
-                // Refine with SGD
-                let n_refine = 30;
-                for step in 0..n_refine {
-                    let lr = 1.0f32 * (1.0 - step as f32 / n_refine as f32);
-                    for (&ni, &w) in nn_indices.iter().zip(weights.iter()) {
-                        let mut dist_sq = 0.0f32;
-                        let mut disp = [0.0f32; 2];
-                        for c in 0..n_components.min(2) {
-                            let diff = pos[c] as f32 - self.embedding[[ni, c]] as f32;
-                            disp[c] = diff;
-                            dist_sq += diff * diff;
-                        }
-                        dist_sq = dist_sq.max(f32::EPSILON);
-
-                        let pd2b = dist_sq.powf(b);
-                        let grad_coeff = (-2.0 * a * b * pd2b) / (dist_sq * (a * pd2b + 1.0));
-
-                        for c in 0..n_components.min(2) {
-                            let grad = (grad_coeff * disp[c]).clamp(-4.0, 4.0);
-                            pos[c] += (lr * w as f32 * grad) as f64;
-                        }
-                    }
-                }
-
-                pos
+                cur
             })
             .collect();
 
         let mut output = Array2::zeros((n_new, n_components));
-        for (i, pos) in results.iter().enumerate() {
+        for (i, r) in rows.iter().enumerate() {
             for c in 0..n_components {
-                output[[i, c]] = pos[c];
+                output[[i, c]] = r[c] as f64;
             }
         }
         output
@@ -231,7 +345,13 @@ impl UmapModel {
             writeln!(f, "{},sigma,{}", subj, self.sigmas[i])?;
             writeln!(f, "{},rho,{}", subj, self.rhos[i])?;
             for j in 0..n_dims {
-                writeln!(f, "{},{},{}", subj, feat_names[j], self.training_data[[i, j]])?;
+                writeln!(
+                    f,
+                    "{},{},{}",
+                    subj,
+                    feat_names[j],
+                    self.training_data[[i, j]]
+                )?;
             }
         }
 
@@ -247,10 +367,17 @@ impl UmapModel {
         let mut first = true;
         for line in reader.lines() {
             let line = line?;
-            if first { first = false; continue; }
+            if first {
+                first = false;
+                continue;
+            }
             let parts: Vec<&str> = line.splitn(3, ',').collect();
             if parts.len() == 3 {
-                triples.push((parts[0].to_string(), parts[1].to_string(), parts[2].to_string()));
+                triples.push((
+                    parts[0].to_string(),
+                    parts[1].to_string(),
+                    parts[2].to_string(),
+                ));
             }
         }
         Ok(Self::from_triples(&triples))
@@ -264,7 +391,10 @@ impl UmapModel {
             if s == "model" {
                 params.insert(p.clone(), o.clone());
             } else if s.starts_with("point_") {
-                point_data.entry(s.clone()).or_default().insert(p.clone(), o.clone());
+                point_data
+                    .entry(s.clone())
+                    .or_default()
+                    .insert(p.clone(), o.clone());
             }
         }
 
@@ -294,8 +424,12 @@ impl UmapModel {
                         embedding[[i, c]] = v.parse().unwrap();
                     }
                 }
-                if let Some(v) = pdata.get("sigma") { sigmas[i] = v.parse().unwrap(); }
-                if let Some(v) = pdata.get("rho") { rhos[i] = v.parse().unwrap(); }
+                if let Some(v) = pdata.get("sigma") {
+                    sigmas[i] = v.parse().unwrap();
+                }
+                if let Some(v) = pdata.get("rho") {
+                    rhos[i] = v.parse().unwrap();
+                }
                 for j in 0..n_dims {
                     if let Some(v) = pdata.get(&feature_names[j]) {
                         training_data[[i, j]] = v.parse().unwrap();
@@ -305,9 +439,20 @@ impl UmapModel {
         }
 
         Self {
-            training_data, embedding, sigmas, rhos,
-            a, b, n_neighbors,
+            training_data,
+            embedding,
+            sigmas,
+            rhos,
+            a,
+            b,
+            n_neighbors,
             feature_names: Some(feature_names),
+            n_epochs: 0,
+            learning_rate: 1.0,
+            negative_sample_rate: 5.0,
+            repulsion_strength: 1.0,
+            transform_seed: 42,
+            threads: 0,
         }
     }
 }
@@ -319,12 +464,21 @@ mod tests {
     #[test]
     fn test_csv_roundtrip() {
         let model = UmapModel {
-            training_data: Array2::from_shape_vec((3, 2), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
+            training_data: Array2::from_shape_vec((3, 2), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+                .unwrap(),
             embedding: Array2::from_shape_vec((3, 2), vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6]).unwrap(),
             sigmas: vec![0.5, 0.6, 0.7],
             rhos: vec![0.1, 0.2, 0.3],
-            a: 1.577, b: 0.8951, n_neighbors: 15,
+            a: 1.577,
+            b: 0.8951,
+            n_neighbors: 15,
             feature_names: Some(vec!["x".into(), "y".into()]),
+            n_epochs: 0,
+            learning_rate: 1.0,
+            negative_sample_rate: 5.0,
+            repulsion_strength: 1.0,
+            transform_seed: 42,
+            threads: 0,
         };
 
         let path = "/tmp/umap_test_model.csv";
@@ -357,8 +511,16 @@ mod tests {
             embedding: Array2::zeros((5, 2)),
             sigmas: vec![1.0; 5],
             rhos: vec![0.0; 5],
-            a: 1.577, b: 0.8951, n_neighbors: 3,
+            a: 1.577,
+            b: 0.8951,
+            n_neighbors: 3,
             feature_names: Some(vec!["a".into(), "b".into(), "c".into()]),
+            n_epochs: 0,
+            learning_rate: 1.0,
+            negative_sample_rate: 5.0,
+            repulsion_strength: 1.0,
+            transform_seed: 42,
+            threads: 0,
         };
 
         let result = std::panic::catch_unwind(|| {
@@ -366,4 +528,9 @@ mod tests {
         });
         assert!(result.is_err());
     }
+}
+
+#[inline]
+fn clip(v: f32) -> f32 {
+    v.clamp(-4.0, 4.0)
 }
