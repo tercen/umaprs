@@ -1,7 +1,8 @@
 # umaprs — status of the `faris/umap-learn-parity` branch, night of 2026-09-21
 
-Goal: `~/tercen/goals/2026-09-21-umaprs.md`. The crate is Alex's; this branch is a PR, and
-nothing here has been pushed to `main`.
+Goal: `~/tercen/goals/2026-09-21-umaprs.md`. This branch is a PR against `main`; nothing here
+has been pushed to `main`. Licence: MIT (added on this branch — the crate had none; MIT matches
+`tercen-rs`, the SDK it sits beside, and constrains nothing that links it).
 
 ## What changed, and how each change is checked
 
