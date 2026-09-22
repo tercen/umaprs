@@ -13,6 +13,7 @@ ndarray = "0.15"
 ndarray-rand = "0.14"
 rand = "0.8"
 rayon = "1.10"
-ndarray-linalg = { version = "0.16", features = ["openblas-static"] }
+# Pure Rust: see src/linalg.rs for why this is not ndarray-linalg + OpenBLAS any more.
+nalgebra = "0.33"
 gauss-quad = "0.2"
 cudarc = { version = "0.12", optional = true, features = ["cuda-12060"] }

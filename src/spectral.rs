@@ -1,5 +1,5 @@
+use crate::linalg::eigh;
 use ndarray::{Array2, Axis};
-use ndarray_linalg::{Eigh, UPLO};
 use ndarray_rand::RandomExt;
 use ndarray_rand::rand_distr::{Distribution, StandardNormal, Uniform};
 use rand::SeedableRng;
@@ -107,7 +107,7 @@ fn compute_spectral_embedding(
     let n_samples = laplacian.nrows();
 
     // Compute all eigenvalues and eigenvectors using symmetric eigendecomposition
-    let (eigenvalues, eigenvectors) = laplacian.clone().eigh(UPLO::Lower)?;
+    let (eigenvalues, eigenvectors) = eigh(laplacian)?;
 
     // Find indices of smallest eigenvalues
     // Sort eigenvalue indices by value (ascending)
@@ -246,7 +246,7 @@ pub(crate) fn pca_reduce(data: &Array2<f64>, n_dims: usize) -> Array2<f64> {
         }
     }
 
-    match cov.eigh(UPLO::Lower) {
+    match eigh(&cov) {
         Ok((eigenvalues, eigenvectors)) => {
             let eig_vec: Vec<f64> = eigenvalues.to_vec();
             let mut indices: Vec<usize> = (0..d).collect();
@@ -327,7 +327,7 @@ pub(crate) fn pca_initialization(
 
     // Eigendecomposition of d×d covariance matrix
     let cov_clone: Array2<f64> = cov;
-    match cov_clone.eigh(UPLO::Lower) {
+    match eigh(&cov_clone) {
         Ok((eigenvalues, eigenvectors)) => {
             // Eigenvalues are in ascending order, we want the largest
             let eig_vec: Vec<f64> = eigenvalues.to_vec();

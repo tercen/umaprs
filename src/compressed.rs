@@ -187,9 +187,7 @@ pub fn pca_compressed(
 
     // Eigendecomposition of d×d covariance
     let cov_arr = Array2::from_shape_vec((d, d), cov).unwrap();
-    use ndarray_linalg::{Eigh, UPLO};
-
-    match cov_arr.eigh(UPLO::Lower) {
+    match crate::linalg::eigh(&cov_arr) {
         Ok((eigenvalues, eigenvectors)) => {
             let eig_vec: Vec<f64> = eigenvalues.to_vec();
             let mut indices: Vec<usize> = (0..d).collect();

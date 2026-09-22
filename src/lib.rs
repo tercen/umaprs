@@ -7,6 +7,7 @@ pub mod gpu;
 mod hnsw;
 mod kdtree;
 mod knn;
+pub mod linalg;
 mod model;
 mod optimize;
 mod quadtree;
