@@ -5,7 +5,7 @@ a <- commandArgs(trailingOnly = TRUE); name <- a[1]; md <- if (length(a) >= 3) a
 X <- as.matrix(read.csv(a[2])); secs <- c()
 for (s in 1:3) {
   set.seed(s); t0 <- proc.time()[["elapsed"]]
-  # the R umap_operator's call, at Jamie's settings; n_sgd_threads = 0 keeps the seed meaningful
+  # the R umap_operator's call, at the reference pipeline's settings; n_sgd_threads = 0 keeps the seed meaningful
   emb <- umap(X, n_neighbors = 15, min_dist = md, n_epochs = 200, init = "spectral", n_sgd_threads = 0)
   secs <- c(secs, proc.time()[["elapsed"]] - t0)
   write.table(emb, sprintf("results/env_%s_uwot_seed%d.csv", name, s), sep = ",", row.names = FALSE, col.names = FALSE)

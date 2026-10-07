@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Stage-by-stage reference outputs from umap-learn 0.5.12, the version Jamie's pipeline pins.
+"""Stage-by-stage reference outputs from umap-learn 0.5.12, the version the reference cytometry pipeline pins.
 
     /tmp/claude-1000/tercenv/bin/python fixtures/gen_umap_learn_fixtures.py
 

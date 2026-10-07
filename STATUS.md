@@ -6,7 +6,7 @@ matching `tercen-rs`). `NOTICE` credits umap-learn (BSD-3-Clause), whose algorit
 
 ## What changed, and how each change is checked
 
-Every stage is held to `umap-learn 0.5.12` — the version Jamie's pipeline pins — **given the
+Every stage is held to `umap-learn 0.5.12` — the version the reference cytometry pipeline pins — **given the
 same kNN**, in `tests/umap_learn_parity.rs`, on synthetic fixtures dumped at 17 significant
 digits by `fixtures/gen_umap_learn_fixtures.py`. Two tolerances appear throughout and mean
 different things: **1e-12** is against a line-for-line float64 transcription of the reference's
@@ -42,7 +42,7 @@ price. The cutoff moved to 16 dims; above it HNSW with an exact 2k refine.
 Same measurement on the HNSW path: kNN + σ + init **16.6 s**, SGD **2.6 s**, whole transform **19.2 s** — seven times faster, and the fit's kNN gains the same way. After the recall fix and the parallel build (below): kNN + σ + init **7.8 s**, whole transform **9.8 s**. Measured at cohort scale (`examples/time_transform.rs 465000 1200000`, 40 dims, 16 cores): **fit 465k in 95.7 s, transform 1.2M in 103.7 s** — three and a half minutes for what the brute-force scan would have needed an hour for.
 
 **Before the index existed**, transforming 400k against 100k took 547 s — and would have been an
-hour at Jamie's 1.2M × 465k.
+hour at 1.2M × 465k (a cohort-scale transform).
 
 **References on the same 50k × 32 synthetic set, 3 seeds, `n_neighbors` 15, `min_dist` 0.01,
 200 epochs**: `umap-learn 0.5.12` **76.8 s** a fit; `uwot 0.2.5` (`n_sgd_threads = 0`, so the seed
@@ -124,7 +124,7 @@ already did.
   the thread count. `threads(1)` is bit-repeatable — the README's "reproducible to 1e-10" was
   only ever true single-threaded, and now says so. `umap-learn` has the same contract.
 - **`pca` + transform.** With `pca` set, the model keeps the reduced training data but not the
-  projection, so `transform` cannot apply it to new points. Not Jamie's configuration.
+  projection, so `transform` cannot apply it to new points. Not the reference pipeline's configuration.
 - **No NNDescent, densMAP, GPU changes, model persistence.** The "triples CSV" format is untouched.
 
 ## For the platform, not this crate

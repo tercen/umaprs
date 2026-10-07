@@ -6,7 +6,7 @@
 For the dataset, runs umap-learn 0.5.12 at three seeds and reads any other engine's embeddings
 from results/env_<name>_<engine>_seed<k>.csv (written by `cargo run --release --example
 embed_csv` for umaprs and by scripts/envelope_uwot.R for uwot). Scores every embedding on the
-metrics the Lyme sweep used:
+metrics the earlier parameter sweep used:
 
   purity        fraction of a cell's 15 nearest 2-D neighbours sharing its label (needs labels)
   trust         sklearn trustworthiness, k = 15
