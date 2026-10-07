@@ -1,8 +1,8 @@
 # umaprs — status of the `faris/umap-learn-parity` branch, night of 2026-09-21
 
 Goal: `~/tercen/goals/2026-09-21-umaprs.md`. This branch is a PR against `main`; nothing here
-has been pushed to `main`. Licence: MIT (added on this branch — the crate had none; MIT matches
-`tercen-rs`, the SDK it sits beside, and constrains nothing that links it).
+has been pushed to `main`. Licence: Apache-2.0 (the crate had none; Tercen's decision of 2026-10-08 for its Rust crates,
+matching `tercen-rs`). `NOTICE` credits umap-learn (BSD-3-Clause), whose algorithms this follows.
 
 ## What changed, and how each change is checked
 
