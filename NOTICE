@@ -1,0 +1,8 @@
+umaprs
+Copyright 2026 Tercen
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+The fuzzy simplicial set, curve fit and transform follow umap-learn
+(https://github.com/lmcinnes/umap), Copyright (c) 2017, Leland McInnes,
+BSD-3-Clause.

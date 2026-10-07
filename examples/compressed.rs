@@ -1,22 +1,30 @@
 use ndarray::Array2;
-use umaprs::{UMAP, QuantBits};
 use std::fs::File;
-use std::io::{Write, BufReader, BufRead};
+use std::io::{BufRead, BufReader, Write};
 use std::time::Instant;
+use umaprs::{QuantBits, UMAP};
 
 fn read_csv(path: &str) -> Array2<f64> {
     let f = File::open(path).unwrap();
     let r = BufReader::new(f);
-    let mut l = r.lines(); l.next();
-    let mut v = Vec::new(); let mut n = 0;
-    for line in l { let l = line.unwrap(); v.extend(l.split(',').map(|s| s.trim().parse::<f64>().unwrap())); n += 1; }
-    Array2::from_shape_vec((n, v.len()/n), v).unwrap()
+    let mut l = r.lines();
+    l.next();
+    let mut v = Vec::new();
+    let mut n = 0;
+    for line in l {
+        let l = line.unwrap();
+        v.extend(l.split(',').map(|s| s.trim().parse::<f64>().unwrap()));
+        n += 1;
+    }
+    Array2::from_shape_vec((n, v.len() / n), v).unwrap()
 }
 
 fn save(e: &Array2<f64>, p: &str) {
     let mut f = File::create(p).unwrap();
     writeln!(f, "V1,V2").unwrap();
-    for i in 0..e.nrows() { writeln!(f, "{},{}", e[[i,0]], e[[i,1]]).unwrap(); }
+    for i in 0..e.nrows() {
+        writeln!(f, "{},{}", e[[i, 0]], e[[i, 1]]).unwrap();
+    }
 }
 
 fn main() {

@@ -1,7 +1,7 @@
 use ndarray::Array2;
-use umaprs::UMAP;
 use std::fs::File;
-use std::io::{Write, BufReader, BufRead};
+use std::io::{BufRead, BufReader, Write};
+use umaprs::UMAP;
 
 fn main() {
     println!("=== Running UMAP on Crabs Dataset (Rust implementation) ===\n");
@@ -19,7 +19,8 @@ fn main() {
 
     for line in lines {
         let line = line.expect("Failed to read line");
-        let values: Vec<f64> = line.split(',')
+        let values: Vec<f64> = line
+            .split(',')
             .map(|s| s.trim().parse::<f64>().expect("Failed to parse number"))
             .collect();
         data_vec.extend(values);
@@ -41,7 +42,7 @@ fn main() {
         .n_components(2)
         .min_dist(0.1)
         .learning_rate(1.0)
-        .n_epochs(200)  // Match uwot
+        .n_epochs(200) // Match uwot
         .random_state(42);
 
     println!("\nUMAP Parameters:");
@@ -67,17 +68,33 @@ fn main() {
     let x_mean: f64 = embedding.column(0).mean().unwrap();
     let y_mean: f64 = embedding.column(1).mean().unwrap();
 
-    let x_std: f64 = (embedding.column(0).iter()
+    let x_std: f64 = (embedding
+        .column(0)
+        .iter()
         .map(|&x| (x - x_mean).powi(2))
-        .sum::<f64>() / (n_samples as f64 - 1.0)).sqrt();
+        .sum::<f64>()
+        / (n_samples as f64 - 1.0))
+        .sqrt();
 
-    let y_std: f64 = (embedding.column(1).iter()
+    let y_std: f64 = (embedding
+        .column(1)
+        .iter()
         .map(|&y| (y - y_mean).powi(2))
-        .sum::<f64>() / (n_samples as f64 - 1.0)).sqrt();
+        .sum::<f64>()
+        / (n_samples as f64 - 1.0))
+        .sqrt();
 
     println!("\n=== Statistics ===");
-    println!("Embedding range X: [{:.6}, {:.6}]", x_vals[0], x_vals[x_vals.len() - 1]);
-    println!("Embedding range Y: [{:.6}, {:.6}]", y_vals[0], y_vals[y_vals.len() - 1]);
+    println!(
+        "Embedding range X: [{:.6}, {:.6}]",
+        x_vals[0],
+        x_vals[x_vals.len() - 1]
+    );
+    println!(
+        "Embedding range Y: [{:.6}, {:.6}]",
+        y_vals[0],
+        y_vals[y_vals.len() - 1]
+    );
     println!("Embedding mean X: {:.6}", x_mean);
     println!("Embedding mean Y: {:.6}", y_mean);
     println!("Embedding sd X: {:.6}", x_std);
@@ -87,8 +104,7 @@ fn main() {
     let mut file = File::create("results/rust_crabs_embedding.csv").expect("Failed to create file");
     writeln!(file, "V1,V2").expect("Failed to write header");
     for i in 0..embedding.nrows() {
-        writeln!(file, "{},{}", embedding[[i, 0]], embedding[[i, 1]])
-            .expect("Failed to write row");
+        writeln!(file, "{},{}", embedding[[i, 0]], embedding[[i, 1]]).expect("Failed to write row");
     }
 
     println!("\nFile saved: results/rust_crabs_embedding.csv");
