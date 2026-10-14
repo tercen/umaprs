@@ -334,9 +334,13 @@ pub(crate) fn pca_initialization(
             let mut indices: Vec<usize> = (0..n_dims).collect();
             indices.sort_by(|&a, &b| eig_vec[b].partial_cmp(&eig_vec[a]).unwrap());
 
-            // Project onto top n_components eigenvectors
+            // Project onto the top n_components eigenvectors. Data with fewer dimensions
+            // than components (a 1-marker embedding, say) only has n_dims of them; the rest
+            // are filled with seeded unit-normal noise below, which matches the sd = 1 scale
+            // of the projected components.
+            let n_proj = n_components.min(n_dims);
             let mut embedding: Array2<f64> = Array2::zeros((n_samples, n_components));
-            for comp in 0..n_components {
+            for comp in 0..n_proj {
                 let eig_idx = indices[comp];
                 for i in 0..n_samples {
                     let mut val: f64 = 0.0;
@@ -348,7 +352,7 @@ pub(crate) fn pca_initialization(
             }
 
             // Scale to std dev = 1 per component (like uwot's init_sdev=1)
-            for comp in 0..n_components {
+            for comp in 0..n_proj {
                 let col_mean = embedding.column(comp).sum() / n_samples as f64;
                 let var: f64 = embedding
                     .column(comp)
@@ -372,14 +376,26 @@ pub(crate) fn pca_initialization(
             for i in 0..n_samples {
                 for j in 0..n_components {
                     let noise: f64 = dist.sample(&mut rng);
-                    embedding[[i, j]] += noise * noise_scale;
+                    embedding[[i, j]] += if j < n_proj {
+                        noise * noise_scale
+                    } else {
+                        noise
+                    };
                 }
             }
 
-            eprintln!(
-                "PCA init: top eigenvalues = [{:.4}, {:.4}]",
-                eigenvalues[indices[0]], eigenvalues[indices[1]]
-            );
+            let top: Vec<String> = indices
+                .iter()
+                .take(n_proj)
+                .map(|&i| format!("{:.4}", eigenvalues[i]))
+                .collect();
+            if n_proj < n_components {
+                eprintln!(
+                    "PCA init: {} dims < {} components; the remaining components start from random noise",
+                    n_dims, n_components
+                );
+            }
+            eprintln!("PCA init: top eigenvalues = [{}]", top.join(", "));
             embedding
         }
         Err(e) => {
@@ -421,6 +437,40 @@ mod tests {
         let graph = SparseGraph::from_triplets(5, &[], &[], &[]);
         let embedding = spectral_layout(&graph, 2, Some(42));
         assert_eq!(embedding.shape(), &[5, 2]);
+    }
+
+    #[test]
+    fn pca_init_with_fewer_dims_than_components() {
+        // One-dimensional data above the dense-spectral threshold used to panic
+        // ("index out of bounds: the len is 1 but the index is 1").
+        let n = SPECTRAL_DENSE_THRESHOLD + 10;
+        let data = Array2::from_shape_fn((n, 1), |(i, _)| i as f64);
+        let emb = pca_initialization(&data, 2, Some(7));
+        assert_eq!(emb.shape(), &[n, 2]);
+        assert!(emb.iter().all(|v| v.is_finite()));
+        // first component is the (scaled) data, second is noise: both have spread
+        for c in 0..2 {
+            let col = emb.column(c);
+            let mean = col.sum() / n as f64;
+            let sd =
+                (col.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n as f64 - 1.0)).sqrt();
+            assert!(sd > 0.5 && sd < 1.5, "component {c} sd {sd}");
+        }
+        // and the same seed is reproducible
+        let emb2 = pca_initialization(&data, 2, Some(7));
+        assert_eq!(emb, emb2);
+    }
+
+    #[test]
+    fn fit_transform_one_dim_does_not_panic() {
+        let n = SPECTRAL_DENSE_THRESHOLD + 10;
+        let data = Array2::from_shape_fn((n, 1), |(i, _)| (i % 37) as f64);
+        let emb = crate::UMAP::new()
+            .n_neighbors(15)
+            .random_state(1)
+            .fit_transform(&data);
+        assert_eq!(emb.shape(), &[n, 2]);
+        assert!(emb.iter().all(|v| v.is_finite()));
     }
 
     #[test]
