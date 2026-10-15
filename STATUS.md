@@ -4,6 +4,36 @@ Goal: `~/tercen/goals/2026-09-21-umaprs.md`. This branch is a PR against `main`;
 has been pushed to `main`. Licence: Apache-2.0 (the crate had none; Tercen's decision of 2026-10-08 for its Rust crates,
 matching `tercen-rs`). `NOTICE` credits umap-learn (BSD-3-Clause), whose algorithms this follows.
 
+## 0.3.0 (2026-10-16): uwot's spectral start for large graphs; `eigh` pairs values with their own vectors
+
+**Sparse spectral start** (`src/sparse_spectral.rs`). Above 2,000 points `Spectral` and `Auto` now
+compute what uwot's `spectral` init computes: the eigenvectors of the normalised Laplacian for the
+2nd and 3rd smallest eigenvalues (uwot: RSpectra `eigs_sym(L, 3, "SM", tol = 1e-4)`), scaled so the
+largest coordinate is 10, plus N(0, 1e-4) noise (`scale_and_jitter`). Solver: thick-restart Lanczos
+with full reorthogonalisation on `D^{-1/2} A D^{-1/2}` with the trivial vector projected out,
+converged to RSpectra's criterion (residual < 1e-4 × the Laplacian eigenvalue). A disconnected graph
+or a solve that does not converge gets the PCA start, as uwot does (`spca`). Deterministic given the
+seed; `UMAP::init_note()` says which start a fit used and how long the solve took. `Auto` was the PCA
+start above 2,000 points; it is now the spectral start, as uwot's and umap-learn's default.
+
+Against uwot (the R operator's call, three seeds each, `min_dist` 0.5, public data):
+
+| Levine-13 (81,747 × 13, 24 populations) | random start (≤ 0.2.1) | PCA start (0.2.2) | spectral (0.3.0) | uwot |
+|---|---|---|---|---|
+| purity | 0.913 | 0.911 | 0.912 | 0.910 |
+| trustworthiness | 0.966 | 0.966 | 0.966 | 0.966 |
+| centroid-distance correlation (global) | **0.34** | 0.76 | 0.77 | 0.78 |
+| same map across seeds (Procrustes) | **0.12** | 0.97 | 0.97 | 0.96 |
+| same map as uwot (Procrustes, Rust vs uwot) | 0.27 | 0.65 | **0.97** | 0.96 (uwot vs uwot) |
+
+Levine-32 (104,184 × 32, HNSW kNN): global 0.10 / 0.59 / **0.67** / 0.70. The spectral start costs
+124 s of a one-core 695,052 × 8 fit (synthetic).
+
+**`linalg::eigh` paired vectors with the wrong values.** nalgebra 0.33.3's `symmetric_eigen` returned
+the trivial Laplacian vector with the value 1.9e-5 and the λ₂ vector with 0 on a clustered graph, so
+the dense spectral start (≤ 2,000 points) could use the trivial vector as a coordinate. Values are now
+each vector's own Rayleigh quotient (`pairing::values_belong_to_their_vectors`).
+
 ## 0.2.2 (2026-10-16): exact kd-tree rebuilt, `Spectral` start fixed above 2,000 points
 
 Found running the Tercen UMAP operator on tercen.com at one CPU (695,052 cells × 8 channels):
