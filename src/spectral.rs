@@ -9,7 +9,7 @@ use crate::sparse::SparseGraph;
 
 /// Above this threshold, skip spectral init and use random initialization
 /// (eigendecomposition requires a dense n×n matrix)
-const SPECTRAL_DENSE_THRESHOLD: usize = 2000;
+pub(crate) const SPECTRAL_DENSE_THRESHOLD: usize = 2000;
 
 /// Initialize embedding using spectral layout with Laplacian eigenvectors.
 /// Falls back to PCA for large datasets (like uwot's "spca" fallback).

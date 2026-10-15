@@ -13,6 +13,7 @@ mod optimize;
 mod quadtree;
 mod quantize;
 mod sparse;
+pub mod sparse_spectral;
 mod spectral;
 pub mod tsne;
 
@@ -94,6 +95,8 @@ pub struct UMAP {
     pub threads: usize,
     /// Sampling strategy for training subset (default: Random)
     pub sampling: SamplingStrategy,
+    /// Which start the last fit used, for a caller that reports it (`init_note`).
+    init_used: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// Run `f` on a rayon pool of `threads` workers; 0 means the global pool. The fit and the
@@ -130,12 +133,25 @@ impl Default for UMAP {
             feature_names: None,
             train_size: None,
             threads: 0,
+            init_used: Default::default(),
             sampling: SamplingStrategy::Random,
         }
     }
 }
 
 impl UMAP {
+    /// The start the last fit used (e.g. "spectral (sparse Lanczos …)" or "PCA, because …"),
+    /// for `Spectral` inits; `None` before a fit or for other inits.
+    pub fn init_note(&self) -> Option<String> {
+        self.init_used.lock().ok().and_then(|g| g.clone())
+    }
+
+    fn note_init(&self, what: &str) {
+        if let Ok(mut g) = self.init_used.lock() {
+            *g = Some(what.to_string());
+        }
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -458,12 +474,42 @@ impl UMAP {
             // `spectral_layout_with_data` documents; without the data it fell back to *random*,
             // which loses the global arrangement (centroid-distance correlation 0.34 vs 0.78 for
             // uwot's spectral start on Levine-13, and a different map at every seed).
-            InitMethod::Spectral => spectral_layout_with_data(
-                &fuzzy_result.graph,
-                self.n_components,
-                self.random_state,
-                Some(data),
-            ),
+            // Up to the dense threshold a dense eigendecomposition; above it the same
+            // eigenvectors by sparse Lanczos, as uwot's `spectral` init computes them. A
+            // disconnected graph or a solve that does not converge gets the PCA start (uwot's
+            // `spca` fallback).
+            // `Auto` is the same: spectral, as uwot's and umap-learn's default.
+            InitMethod::Spectral | InitMethod::Auto
+                if n_samples > spectral::SPECTRAL_DENSE_THRESHOLD =>
+            {
+                let t = std::time::Instant::now();
+                match sparse_spectral::sparse_spectral_layout(
+                    &fuzzy_result.graph,
+                    self.n_components,
+                    self.random_state.unwrap_or(42),
+                ) {
+                    Ok(e) => {
+                        self.note_init(&format!(
+                            "spectral (sparse Lanczos on the normalised Laplacian, {:.1} s)",
+                            t.elapsed().as_secs_f64()
+                        ));
+                        e
+                    }
+                    Err(why) => {
+                        self.note_init(&format!("PCA, because the spectral start failed: {why:?}"));
+                        spectral::pca_initialization(data, self.n_components, self.random_state)
+                    }
+                }
+            }
+            InitMethod::Spectral | InitMethod::Auto => {
+                self.note_init("spectral (dense)");
+                spectral_layout_with_data(
+                    &fuzzy_result.graph,
+                    self.n_components,
+                    self.random_state,
+                    Some(data),
+                )
+            }
             InitMethod::Pca => {
                 spectral::pca_initialization(data, self.n_components, self.random_state)
             }
@@ -471,12 +517,6 @@ impl UMAP {
                 fuzzy_result.graph.n_nodes,
                 self.n_components,
                 self.random_state,
-            ),
-            InitMethod::Auto => spectral_layout_with_data(
-                &fuzzy_result.graph,
-                self.n_components,
-                self.random_state,
-                Some(data),
             ),
         };
 

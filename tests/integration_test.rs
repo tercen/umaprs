@@ -151,31 +151,42 @@ fn test_umap_larger_dataset() {
     assert!(embedding.iter().all(|&x| x.is_finite()));
 }
 
-/// Above the dense-eigendecomposition threshold (2,000 points) a `Spectral` start is the PCA
-/// start, like uwot's "spca" fallback and `Auto`. It used to be a random start, which keeps the
-/// local structure but loses the global arrangement and gives a different map at every seed.
+/// Above the dense-eigendecomposition threshold (2,000 points) a `Spectral` start is the sparse
+/// spectral start (uwot's `spectral`), and `Auto` is the same. It used to be a *random* start,
+/// which keeps local structure but loses the global arrangement and changes at every seed.
 #[test]
-fn spectral_start_above_the_dense_threshold_is_the_pca_start() {
+fn spectral_start_above_the_dense_threshold_is_sparse_spectral() {
     use rand::{Rng, SeedableRng};
     let mut rng = rand::rngs::StdRng::seed_from_u64(3);
     let (n, d) = (2500, 6);
+    // Five overlapping groups: a connected kNN graph.
     let data = Array2::from_shape_fn((n, d), |(i, j)| {
-        ((i % 5) * (j + 1)) as f64 + rng.gen_range(-0.5..0.5)
+        ((i % 5) * (j + 1)) as f64 * 0.3 + rng.gen_range(-1.0..1.0)
     });
     let fit = |init: umaprs::InitMethod| {
-        UMAP::new()
+        let u = UMAP::new()
             .n_neighbors(15)
             .n_epochs(20)
             .init(init)
             .random_state(7)
-            .threads(1)
-            .fit_transform(&data)
+            .threads(1);
+        let e = u.fit_transform(&data);
+        (e, u.init_note())
     };
-    let spectral = fit(umaprs::InitMethod::Spectral);
+    let (spectral, note) = fit(umaprs::InitMethod::Spectral);
+    assert!(
+        note.as_deref()
+            .unwrap_or("")
+            .starts_with("spectral (sparse"),
+        "{note:?}"
+    );
+    let (auto, _) = fit(umaprs::InitMethod::Auto);
+    assert_eq!(spectral, auto, "auto is spectral");
+    assert_ne!(spectral, fit(umaprs::InitMethod::Pca).0);
+    assert_ne!(spectral, fit(umaprs::InitMethod::Random).0);
     assert_eq!(
         spectral,
-        fit(umaprs::InitMethod::Pca),
-        "spectral above 2,000 points is the PCA start"
+        fit(umaprs::InitMethod::Spectral).0,
+        "reproducible"
     );
-    assert_ne!(spectral, fit(umaprs::InitMethod::Random));
 }
