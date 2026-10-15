@@ -150,3 +150,32 @@ fn test_umap_larger_dataset() {
     assert_eq!(embedding.shape(), &[50, 2]);
     assert!(embedding.iter().all(|&x| x.is_finite()));
 }
+
+/// Above the dense-eigendecomposition threshold (2,000 points) a `Spectral` start is the PCA
+/// start, like uwot's "spca" fallback and `Auto`. It used to be a random start, which keeps the
+/// local structure but loses the global arrangement and gives a different map at every seed.
+#[test]
+fn spectral_start_above_the_dense_threshold_is_the_pca_start() {
+    use rand::{Rng, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+    let (n, d) = (2500, 6);
+    let data = Array2::from_shape_fn((n, d), |(i, j)| {
+        ((i % 5) * (j + 1)) as f64 + rng.gen_range(-0.5..0.5)
+    });
+    let fit = |init: umaprs::InitMethod| {
+        UMAP::new()
+            .n_neighbors(15)
+            .n_epochs(20)
+            .init(init)
+            .random_state(7)
+            .threads(1)
+            .fit_transform(&data)
+    };
+    let spectral = fit(umaprs::InitMethod::Spectral);
+    assert_eq!(
+        spectral,
+        fit(umaprs::InitMethod::Pca),
+        "spectral above 2,000 points is the PCA start"
+    );
+    assert_ne!(spectral, fit(umaprs::InitMethod::Random));
+}
