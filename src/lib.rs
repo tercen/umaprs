@@ -454,9 +454,16 @@ impl UMAP {
 
         // Initialize embedding
         let mut embedding = match &self.init {
-            InitMethod::Spectral => {
-                spectral_layout(&fuzzy_result.graph, self.n_components, self.random_state)
-            }
+            // Above the dense threshold this is the PCA start (uwot's "spca" fallback), as
+            // `spectral_layout_with_data` documents; without the data it fell back to *random*,
+            // which loses the global arrangement (centroid-distance correlation 0.34 vs 0.78 for
+            // uwot's spectral start on Levine-13, and a different map at every seed).
+            InitMethod::Spectral => spectral_layout_with_data(
+                &fuzzy_result.graph,
+                self.n_components,
+                self.random_state,
+                Some(data),
+            ),
             InitMethod::Pca => {
                 spectral::pca_initialization(data, self.n_components, self.random_state)
             }

@@ -4,6 +4,44 @@ Goal: `~/tercen/goals/2026-09-21-umaprs.md`. This branch is a PR against `main`;
 has been pushed to `main`. Licence: Apache-2.0 (the crate had none; Tercen's decision of 2026-10-08 for its Rust crates,
 matching `tercen-rs`). `NOTICE` credits umap-learn (BSD-3-Clause), whose algorithms this follows.
 
+## 0.2.2 (2026-10-16): exact kd-tree rebuilt, `Spectral` start fixed above 2,000 points
+
+Found running the Tercen UMAP operator on tercen.com at one CPU (695,052 cells × 8 channels):
+2.0.1 took 814 s against the R operator's (uwot) 431 s. 58% of a one-core fit was the kd-tree.
+
+**kd-tree** (`src/kdtree.rs`, used up to 16 dims for the fit and the transform's index). The old
+tree had one point per node, rescanned its k best for the worst on every visit, pruned on the last
+split plane only and split dimensions round-robin. Now: leaves of 16 points stored contiguously,
+median split on the widest dimension, a sorted k-best array, and the incremental box distance
+(Arya & Mount). Distances are computed exactly as before (`dist_sq`, f32, dimension order).
+Results are **canonical**: ascending by (distance, index). The old tree left the order of points
+at exactly equal distance to its visiting order; that is the only possible difference.
+
+One core (`taskset -c 0`), old tree against new, kNN rows compared one by one:
+
+| data | old | new | speed-up | rows identical | differ only by exact ties | differ otherwise |
+|---|---|---|---|---|---|---|
+| Levine-13 (81,747 × 13, real) | 277.5 s | 14.9 s | 18.7× | 81,747 | 0 | 0 |
+| mixture 50,000 × 8 | 39.0 s | 3.0 s | 12.9× | 49,999 | 1 | 0 |
+| mixture 200,000 × 8 | 183.4 s | 12.5 s | 14.6× | 199,998 | 2 | 0 |
+| mixture 200,000 × 8, values on a 0.25 grid | 152.3 s | 10.9 s | 14.0× | 166 | 199,834 | 0 |
+| mixture 100,000 × 16 | 120.3 s | 13.6 s | 8.8× | 99,999 | 1 | 0 |
+| mixture 100,000 × 3 | 2.3 s | 0.5 s | 4.8× | 100,000 | 0 | 0 |
+
+On gridded values (integer channels, clipped events) nearly every row has ties, so embeddings of
+such data change from 0.2.1 as a different seed would; elsewhere they are identical. Unit tests
+check the tree against brute force on 1-16 dims, with duplicates, an integer grid and all points
+equal (`kdtree::tests`).
+
+**`InitMethod::Spectral` above 2,000 points was a random start.** `spectral_layout` was called
+without the data, so the PCA fallback it documents (uwot's `spca`) never ran. A random start keeps
+local structure but not the global arrangement: on Levine-13 (24 gated populations) the Spearman
+correlation of population-centroid distances, marker space against 2-D, was **0.34** against
+**0.78** for uwot's spectral start, and a different map at every seed (Procrustes agreement
+between seeds 0.12 against 0.96). With the PCA start: 0.76 and 0.97, inside uwot's range. Every
+Tercen step upgraded from the R operator carries `init = spectral`. Test:
+`spectral_start_above_the_dense_threshold_is_the_pca_start`.
+
 ## What changed, and how each change is checked
 
 Every stage is held to `umap-learn 0.5.12` — the version the reference cytometry pipeline pins — **given the
