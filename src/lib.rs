@@ -19,7 +19,9 @@ pub mod tsne;
 
 pub use fuzzy::compute_fuzzy_simplicial_set;
 pub use knn::{DEFAULT_EF_SEARCH, DEFAULT_REFINE, compute_knn_external, compute_knn_hnsw_tuned};
-pub use knn::{compute_knn_bruteforce, compute_knn_graph, compute_knn_hnsw_f32};
+pub use knn::{
+    compute_knn_bruteforce, compute_knn_graph, compute_knn_hnsw_f32, compute_knn_kdtree,
+};
 pub use model::TransformStages;
 pub use model::{SamplingStrategy, UmapModel};
 pub use optimize::optimize_layout;
@@ -98,6 +100,11 @@ pub struct UMAP {
     /// Which start the last fit used, for a caller that reports it (`init_note`).
     init_used: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
+
+/// Above this many points the spectral start is the sparse Lanczos solve (uwot uses RSpectra at
+/// every size). The dense eigendecomposition is O(n³): 22.6 s at 1,800 points on one core against
+/// uwot's whole 8.3 s fit; below this size it costs well under a second.
+const SPARSE_SPECTRAL_MIN_POINTS: usize = 200;
 
 /// Run `f` on a rayon pool of `threads` workers; 0 means the global pool. The fit and the
 /// model's `transform` both go through this, so `threads = 1` is sequential end to end.
@@ -479,9 +486,7 @@ impl UMAP {
             // disconnected graph or a solve that does not converge gets the PCA start (uwot's
             // `spca` fallback).
             // `Auto` is the same: spectral, as uwot's and umap-learn's default.
-            InitMethod::Spectral | InitMethod::Auto
-                if n_samples > spectral::SPECTRAL_DENSE_THRESHOLD =>
-            {
+            InitMethod::Spectral | InitMethod::Auto if n_samples > SPARSE_SPECTRAL_MIN_POINTS => {
                 let t = std::time::Instant::now();
                 match sparse_spectral::sparse_spectral_layout(
                     &fuzzy_result.graph,
