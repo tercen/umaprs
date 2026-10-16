@@ -13,18 +13,30 @@ const TREE_THRESHOLD: usize = 500;
 /// of which the SGD was 0.3 s. Above this, HNSW with an exact 2k refine.
 const KDTREE_MAX_DIMS: usize = 16;
 
+/// The *fit's* kNN graph stays exact up to this many dimensions (the 0.2.2 tree: one core, 104k
+/// × 32 in 80 s against HNSW's 31 s). HNSW at recall 0.998 still changed the graph enough to move
+/// the spectral start: on Levine-32 the map agreed with uwot's at 0.61 against 0.89 with the exact
+/// graph, and varied between seeds (0.78 against 0.97). Projection queries (`compute_knn_external`)
+/// keep `KDTREE_MAX_DIMS`: they are many more, and an approximate neighbour there only moves one
+/// projected point.
+const FIT_KDTREE_MAX_DIMS: usize = 40;
+
+/// Above `FIT_KDTREE_MAX_DIMS` the fit's HNSW graph is built with this seed whatever the UMAP
+/// seed, so the graph depends on the data only and a new seed changes the layout, not the graph.
+pub const FIT_HNSW_SEED: u64 = 42;
+
 /// Compute k-nearest neighbors for each point.
 /// Strategy:
 ///   - Small datasets (<=500): exact brute-force
-///   - Large + low-dim (<=40): kd-tree (exact, like uwot's FNN)
-///   - Large + high-dim (>40): HNSW (approximate)
+///   - Large + up to 40 dims: kd-tree (exact)
+///   - Large + above 40 dims: HNSW (approximate), built with `FIT_HNSW_SEED`
 pub fn compute_knn_graph(data: &Array2<f64>, k: usize, seed: u64) -> Array2<usize> {
     let n_samples = data.nrows();
     let n_dims = data.ncols();
 
     if n_samples <= TREE_THRESHOLD {
         compute_knn_bruteforce(data, k)
-    } else if n_dims <= KDTREE_MAX_DIMS {
+    } else if n_dims <= FIT_KDTREE_MAX_DIMS {
         eprintln!(
             "Using kd-tree exact nearest neighbors ({} points, {} dims)",
             n_samples, n_dims
@@ -35,7 +47,8 @@ pub fn compute_knn_graph(data: &Array2<f64>, k: usize, seed: u64) -> Array2<usiz
             "Using HNSW approximate nearest neighbors ({} points, {} dims)",
             n_samples, n_dims
         );
-        compute_knn_hnsw_f32(data, k, seed)
+        let _ = seed;
+        compute_knn_hnsw_f32(data, k, FIT_HNSW_SEED)
     }
 }
 

@@ -4,6 +4,33 @@ Goal: `~/tercen/goals/2026-09-21-umaprs.md`. This branch is a PR against `main`;
 has been pushed to `main`. Licence: Apache-2.0 (the crate had none; Tercen's decision of 2026-10-08 for its Rust crates,
 matching `tercen-rs`). `NOTICE` credits umap-learn (BSD-3-Clause), whose algorithms this follows.
 
+## 0.4.0 (2026-10-16): exact kNN for the fit up to 40 dims; sparse spectral start above 200 points
+
+From an in-depth comparison with uwot (the R operator's call; HDCytoData Levine-13/32, Samusik-01,
+Nilsson-rare, Mosmann-rare; 235 one-core fits).
+
+- **Fit kNN exact up to 40 dims** (was 16). With HNSW (recall 0.998, built with the UMAP seed) the
+  spectral start moved between seeds and away from uwot's: Levine-32 seed-to-seed Procrustes 0.78
+  vs uwot 0.95, Rust-vs-uwot map 0.60. A frozen HNSW graph fixed the first (0.97) but not the
+  second (0.61); the exact graph fixed both. Above 40 dims HNSW is built with `FIT_HNSW_SEED` so the
+  graph depends on the data only. Projection queries keep `KDTREE_MAX_DIMS` (16).
+- **Sparse spectral start above 200 points** (was 2,000): the dense O(n³) solve took 22.6 s at 1,800
+  points (uwot's whole fit: 8.3 s).
+
+| | 0.3.0 | 0.4.0 | uwot |
+|---|---|---|---|
+| Levine-32 seed stability (Procrustes) | 0.78 | 0.94 | 0.95 |
+| Levine-32 map vs uwot | 0.60 | 0.86 | 0.95 (uwot-uwot) |
+| Samusik-01 seed stability | 0.72 | 0.95 | 0.94 |
+| Samusik-01 map vs uwot | 0.77 | 0.88 | 0.94 |
+| 1,800 points: map vs uwot / time | 0.63 / 23.3 s | 0.87 / 1.9 s | 0.86 / 8.3 s |
+| one core, Levine-32 (104k × 32) | 51 s | 81 s | 78 s (0.98 GB vs 0.26) |
+| one core, Samusik-01 (53k × 39) | 32 s | 41 s | 44 s (0.73 GB vs 0.14) |
+
+Every metric (purity, worst-population purity, silhouette, trustworthiness, kNN preservation,
+centroid-distance correlation, rare-population purity, stability) is inside uwot's seed range or
+above it. Embeddings change for 17-40 dims and 201-2,000 points.
+
 ## 0.3.0 (2026-10-16): uwot's spectral start for large graphs; `eigh` pairs values with their own vectors
 
 **Sparse spectral start** (`src/sparse_spectral.rs`). Above 2,000 points `Spectral` and `Auto` now
